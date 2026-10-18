@@ -12,19 +12,24 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::CloseHandle;
+use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
-    CreateProcessW, OpenProcess, TerminateProcess, CREATE_NEW_CONSOLE, NORMAL_PRIORITY_CLASS,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_TERMINATE, STARTF_USESHOWWINDOW,
-    STARTUPINFOW,
+    CreateProcessW, GetCurrentProcessId, OpenProcess, TerminateProcess, CREATE_NEW_CONSOLE,
+    NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_TERMINATE,
+    STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
-use windows::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, SW_HIDE, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW,
+    SetWindowPos, SHOW_WINDOW_CMD, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    WM_WINDOWPOSCHANGING, WINDOWPOS, WNDPROC, GWLP_HWNDPARENT, GWLP_WNDPROC, GW_OWNER,
+};
 
 slint::include_modules!();
 
@@ -280,6 +285,190 @@ fn with_php_env<T>(basedir: &Path, f: impl FnOnce() -> T) -> T {
         None => std::env::remove_var("PHPRC"),
     }
     out
+}
+
+// Sub-window anchoring: Slint 1.18 exposes none of this, so it is plain Win32.
+// A sub-window is made an OWNED window of the panel (GWLP_HWNDPARENT): no taskbar
+// button, stays above it, hides together with it. Its position is pinned by a
+// WM_WINDOWPOSCHANGING subclass that rewrites every proposed move back to the
+// coordinates captured when the window first appeared, which makes title-bar
+// dragging inert. Resizing is already prevented at the .slint level (fixed
+// width/height, min == max).
+static MAIN_HWND: std::sync::OnceLock<std::sync::Mutex<isize>> = std::sync::OnceLock::new();
+
+fn main_hwnd() -> Option<isize> {
+    let h = *MAIN_HWND
+        .get_or_init(|| std::sync::Mutex::new(0))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (h != 0).then_some(h)
+}
+
+fn set_main_hwnd(h: isize) {
+    *MAIN_HWND
+        .get_or_init(|| std::sync::Mutex::new(0))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = h;
+}
+
+unsafe extern "system" fn collect_self_wnd(hwnd: HWND, l: LPARAM) -> BOOL {
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == GetCurrentProcessId() && IsWindowVisible(hwnd).as_bool() {
+        let v = &mut *(l.0 as *mut Vec<isize>);
+        v.push(hwnd.0 as isize);
+    }
+    true.into()
+}
+
+/// HWNDs of this process's visible top-level windows.
+fn self_windows() -> Vec<isize> {
+    let mut v: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(collect_self_wnd), LPARAM(&mut v as *mut _ as isize));
+    }
+    v
+}
+
+// HWND -> ((pinned x, pinned y), original WNDPROC). Backs the classic
+// GWLP_WNDPROC hook below; the hook lives for the whole process lifetime.
+static PIN_MAP: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<isize, ([i32; 2], isize)>>,
+> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn pin_pos_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let map = PIN_MAP.get_or_init(Default::default);
+    let entry = map
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(hwnd.0 as isize))
+        .copied();
+    if let Some((pin, orig)) = entry {
+        if msg == WM_WINDOWPOSCHANGING {
+            let pos = &mut *(lparam.0 as *mut WINDOWPOS);
+            pos.x = pin[0];
+            pos.y = pin[1];
+        }
+        let orig: WNDPROC = Some(core::mem::transmute(orig));
+        return CallWindowProcW(orig, hwnd, msg, wparam, lparam);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// HWNDs already anchored, so a singleton re-show is never hooked twice.
+static ANCHORED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<isize>>> =
+    std::sync::OnceLock::new();
+
+/// Window titles used for anchoring/tests; must match the `title:` literals in
+/// ui/main.slint (Slint does not expose a getter for the window title).
+const TITLE_MAIN: &str = "RAMP Control Panel";
+const TITLE_SETTINGS: &str = "Settings";
+const TITLE_UPDATES: &str = "Component Updates";
+const TITLE_ABOUT: &str = "About RAMP Control Panel";
+const TITLE_FILES: &str = "RAMP Files";
+
+/// Show a sub-window, then anchor it on the main window (owned: no taskbar
+/// button; position pinned). Slint maps the native HWND only after show()
+/// returns, so anchoring runs on a retry timer that matches the window by its
+/// title.
+fn show_and_anchor(win: &slint::Window, title: &str) {
+    let _ = win.show();
+    anchor_by_title(title.to_string(), 10);
+}
+
+fn find_win_by_title(title: &str, skip: &[isize]) -> Option<isize> {
+    let mut tb = [0u16; 128];
+    self_windows().into_iter().find(|h| {
+        if *h == 0 || skip.contains(h) {
+            return false;
+        }
+        unsafe {
+            let tl = GetWindowTextW(HWND(*h as *mut core::ffi::c_void), &mut tb) as usize;
+            String::from_utf16_lossy(&tb[..tl.min(128)]) == title
+        }
+    })
+}
+
+fn fix_main_hwnd(title: String, retries: u8) {
+    Timer::single_shot(std::time::Duration::from_millis(60), move || {
+        if let Some(h) = find_win_by_title(&title, &[]) {
+            set_main_hwnd(h);
+            eprintln!("main HWND fixed = 0x{h:x} (title \"{title}\")");
+        } else if retries > 0 {
+            fix_main_hwnd(title, retries - 1);
+        }
+    });
+}
+
+fn anchor_by_title(title: String, retries: u8) {
+    Timer::single_shot(std::time::Duration::from_millis(60), move || {
+        let Some(owner) = main_hwnd() else {
+            eprintln!("anchor: MAIN_HWND unset, skipped");
+            return;
+        };
+        let mut tb = [0u16; 128];
+        let mut found: Option<isize> = None;
+        for h in self_windows() {
+            if h == owner
+                || ANCHORED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&h)
+            {
+                continue;
+            }
+            unsafe {
+                let tl = GetWindowTextW(HWND(h as *mut core::ffi::c_void), &mut tb) as usize;
+                if String::from_utf16_lossy(&tb[..tl.min(128)]) == title {
+                    found = Some(h);
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(h) = found else {
+            if retries > 0 {
+                anchor_by_title(title, retries - 1);
+            } else {
+                eprintln!("anchor: no HWND ever matched title \"{title}\"");
+            }
+            return;
+        };
+        ANCHORED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(h);
+        unsafe {
+            let hwnd = HWND(h as *mut core::ffi::c_void);
+            let prev = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_ok() {
+                // Never removed on purpose: the hook outlives the window.
+                let orig = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pin_pos_proc as *const () as isize);
+                if orig != 0 {
+                    PIN_MAP
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(h, ([rc.left, rc.top], orig));
+                    eprintln!(
+                        "anchor: \"{title}\" hwnd=0x{h:x} owner=0x{owner:x} prev_owner=0x{prev:x} pin=({},{})",
+                        rc.left, rc.top
+                    );
+                } else {
+                    eprintln!("anchor: hwnd=0x{h:x} WNDPROC hook failed");
+                }
+            }
+        }
+    });
 }
 
 /// Blocking start used by the updater: same command lines as start_module(), but
@@ -1206,7 +1395,7 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
         }
     };
     win.set_app_version(format!("Version RAMP v{}", env!("CARGO_PKG_VERSION")).into());
-    win.show().ok();
+    show_and_anchor(win.window(), TITLE_ABOUT);
 }
 
 /// Open or re-show the update window. The first open starts a check right away
@@ -1232,7 +1421,7 @@ fn show_updates(app: &AppRc, ui: &Ui) {
     win.set_allow_major(app.borrow().cfg.upd_allow_major);
     let busy = app.borrow().upd_busy;
     win.set_busy(busy);
-    let _ = win.show();
+    show_and_anchor(win.window(), TITLE_UPDATES);
     if fresh {
         let app_w = app.clone();
         let ui_w = ui.clone();
@@ -1854,7 +2043,7 @@ fn show_file_window(app: &AppRc, ui: &Ui, kind: &str, idx: usize) {
         }
     };
     win.set_heading(heading.into());
-    let _ = win.show();
+    show_and_anchor(win.window(), TITLE_FILES);
 }
 
 fn show_settings_window(app: &AppRc, ui: &Ui) {
@@ -1904,7 +2093,7 @@ fn show_settings_window(app: &AppRc, ui: &Ui) {
         win.set_editor(cfg.editor.clone().into());
         win.set_browser(cfg.browser.clone().into());
     }
-    let _ = win.show();
+    show_and_anchor(win.window(), TITLE_SETTINGS);
 }
 
 fn do_quit(app: &mut App, ui: &Ui) {
@@ -2289,6 +2478,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     main_window.show()?;
+    // Remember the main window's HWND: every sub-window is anchored onto it.
+    // Slint maps the native HWND shortly after show() and the process also owns
+    // helper windows with empty titles, so match on the Slint title and fix up
+    // on a retry timer when that match is not immediate.
+    let mtitle = TITLE_MAIN.to_string();
+    unsafe {
+        for h in self_windows() {
+            let hwnd = HWND(h as *mut core::ffi::c_void);
+            let mut tb = [0u16; 128];
+            let tl = GetWindowTextW(hwnd, &mut tb) as usize;
+            let mut cl = [0u16; 64];
+            let cll = GetClassNameW(hwnd, &mut cl) as usize;
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rc);
+            eprintln!(
+                "topwin 0x{h:x} class=\"{}\" title=\"{}\" rect=({},{},{},{})",
+                String::from_utf16_lossy(&cl[..cll.min(64)]),
+                String::from_utf16_lossy(&tb[..tl.min(128)]),
+                rc.left,
+                rc.top,
+                rc.right,
+                rc.bottom
+            );
+        }
+    }
+    let direct = find_win_by_title(&mtitle, &[]);
+    match direct.or_else(|| self_windows().first().copied()) {
+        Some(h) => {
+            eprintln!("main HWND = 0x{h:x} (title \"{mtitle}\")");
+            set_main_hwnd(h);
+        }
+        None => eprintln!("main HWND not found after show()"),
+    }
+    if direct.is_none() {
+        fix_main_hwnd(mtitle, 10);
+    }
 
     // 500 ms timer: TimerUpdateStatus + TimerUpdateNetworking merged.
     let timer = Timer::default();
@@ -2729,6 +2954,120 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             add_log(&mut a, &ui_t, "update", "compat patch finished", LogType::Info);
             do_quit(&mut a, &ui_t);
         });
+            }
+    
+    // Hidden test mode: ramp --dialog-check [hold_secs]
+    // Opens every sub-window, then asserts each is owned by the main window
+    // (no taskbar button) and position-locked (proposed moves rejected).
+    if let Some(pos) = args.iter().position(|a| a == "--dialog-check") {
+            let hold: u64 = args.get(pos + 1).and_then(|s| s.parse().ok()).unwrap_or(3);
+            let app_t = app.clone();
+            let ui_t = ui.clone();
+            Timer::single_shot(std::time::Duration::from_millis(900), move || {
+        show_settings_window(&app_t, &ui_t);
+        show_updates(&app_t, &ui_t);
+        show_about_window(&app_t, &ui_t);
+        show_file_window(&app_t, &ui_t, "config", 0);
+            });
+            let app_t = app.clone();
+            let ui_t = ui.clone();
+            Timer::single_shot(
+        std::time::Duration::from_millis(900 + hold * 1000),
+        move || {
+            let mut a = app_t.borrow_mut();
+            let main_h = match main_hwnd() {
+                Some(h) => h,
+                None => {
+                    add_log(&mut a, &ui_t, "main", "TEST FAIL: main window HWND unknown", LogType::Error);
+                    do_quit(&mut a, &ui_t);
+                    return;
+                }
+            };
+            let expected = [
+                TITLE_SETTINGS,
+                TITLE_UPDATES,
+                TITLE_ABOUT,
+                TITLE_FILES,
+            ];
+            let mut ok = 0usize;
+            unsafe {
+                for want in expected {
+                    let mut hwnd: Option<HWND> = None;
+                    for h in self_windows() {
+                        if h == main_h {
+                            continue;
+                        }
+                        let mut tb = [0u16; 128];
+                        let tl = GetWindowTextW(HWND(h as *mut core::ffi::c_void), &mut tb) as usize;
+                        if String::from_utf16_lossy(&tb[..tl.min(128)]) == want {
+                            hwnd = Some(HWND(h as *mut core::ffi::c_void));
+                            break;
+                        }
+                    }
+                    let Some(hwnd) = hwnd else {
+                        add_log(
+                            &mut a,
+                            &ui_t,
+                            "main",
+                            &format!("TEST FAIL: dialog \"{want}\" not found"),
+                            LogType::Error,
+                        );
+                        continue;
+                    };
+                    let owned = GetWindow(hwnd, GW_OWNER)
+                        .map(|o| o.0 as isize == main_h)
+                        .unwrap_or(false);
+                    let hooked = GetWindowLongPtrW(hwnd, GWLP_WNDPROC) as usize
+                        == pin_pos_proc as *const () as usize;
+                    let mut r0 = RECT::default();
+                    let mut r1 = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut r0);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        r0.left + 150,
+                        r0.top + 150,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    let _ = GetWindowRect(hwnd, &mut r1);
+                    let pinned = hooked && r0.left == r1.left && r0.top == r1.top;
+                    if owned && pinned {
+                        ok += 1;
+                    } else {
+                        add_log(
+                            &mut a,
+                            &ui_t,
+                            "main",
+                            &format!(
+                                "dialog \"{want}\": owned={owned} hooked={hooked} pinned={pinned}"
+                            ),
+                            LogType::Error,
+                        );
+                    }
+                }
+            }
+            if ok == expected.len() {
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    &format!("TEST PASS: {}/{} sub-windows anchored (no taskbar, immovable)", ok, expected.len()),
+                    LogType::Info,
+                );
+            } else {
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    &format!("TEST FAIL: {ok}/{} sub-windows anchored", expected.len()),
+                    LogType::Error,
+                );
+            }
+            do_quit(&mut a, &ui_t);
+        },
+            );
     }
 
     slint::run_event_loop()?;

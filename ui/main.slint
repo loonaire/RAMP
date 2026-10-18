@@ -182,8 +182,8 @@ export component MainWindow inherits Window {
 
 export component ConfigWindow inherits Window {
     title: "Settings";
-    preferred-width: 480px;
-    preferred-height: 440px;
+    width: 480px;
+    height: 440px;
 
     in-out property <string> apache-port;
     in-out property <string> apache-ssl-port;
@@ -257,10 +257,8 @@ export struct UpdateInfo {
 
 export component UpdateWindow inherits Window {
     title: "Component Updates";
-    preferred-width: 680px;
-    preferred-height: 430px;
-    min-width: 560px;
-    min-height: 320px;
+    width: 680px;
+    height: 430px;
 
     in property <[UpdateInfo]> rows;
     in property <bool> busy;
@@ -397,9 +395,9 @@ export struct FileRow {
 }
 
 export component FileWindow inherits Window {
-    title: "XAMPP Files";
-    preferred-width: 520px;
-    preferred-height: 380px;
+    title: "RAMP Files";
+    width: 520px;
+    height: 380px;
 
     in property <string> heading;
     in property <[FileRow]> rows;
@@ -451,8 +449,8 @@ export component FileWindow inherits Window {
 
 export component AboutWindow inherits Window {
     title: "About RAMP Control Panel";
-    preferred-width: 340px;
-    preferred-height: 230px;
+    width: 340px;
+    height: 230px;
 
     in property <string> app-version;
 
