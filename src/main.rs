@@ -504,7 +504,7 @@ static FDELTA: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i32, i32)>>
 /// show(). The anchored-window test keeps these in sync with the .slint.
 fn declared_size(title: &str) -> Option<(i32, i32)> {
     match title {
-        TITLE_MAIN => Some((710, 460)),
+        TITLE_MAIN => Some((690, 460)),
         TITLE_SETTINGS => Some((480, 440)),
         TITLE_UPDATES => Some((680, 430)),
         TITLE_FILES => Some((520, 380)),

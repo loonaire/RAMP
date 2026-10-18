@@ -21,7 +21,7 @@ export struct LogLine {
 
 export component MainWindow inherits Window {
     title: "RAMP Control Panel";
-    width: 710px;
+    width: 690px;
     height: 480px;
 
     in property <[ModuleInfo]> modules;
@@ -30,7 +30,7 @@ export component MainWindow inherits Window {
 
     // The ports column only ever holds "80, 443", so a fixed 120px left a hole
     // before the status pill. Rust sizes it to the widest list it has to show.
-    in property <length> port-col-width: 66px;
+    in property <length> port-col-width: 60px;
 
     in property <string> update-badge;
     in property <bool> update-busy;
