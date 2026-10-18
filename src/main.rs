@@ -25,10 +25,12 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SetWindowLongPtrW,
-    SetWindowPos, SHOW_WINDOW_CMD, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    WM_WINDOWPOSCHANGING, WINDOWPOS, WNDPROC, GWLP_HWNDPARENT, GWLP_WNDPROC, GW_OWNER,
+    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetSystemMetrics, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    SetWindowLongPtrW, SetWindowPos, SHOW_WINDOW_CMD, SM_CXSCREEN, SM_CYSCREEN,
+    SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDPROC,
+    GWLP_HWNDPARENT, GWLP_WNDPROC, GW_OWNER, SystemParametersInfoW,
 };
 
 slint::include_modules!();
@@ -376,8 +378,8 @@ const TITLE_FILES: &str = "RAMP Files";
 /// button; position pinned). Slint maps the native HWND only after show()
 /// returns, so anchoring runs on a retry timer that matches the window by its
 /// title.
-fn show_and_anchor(win: &slint::Window, title: &str) {
-    let _ = win.show();
+fn show_and_anchor<W: ComponentHandle>(win: &Rc<W>, title: &str) {
+    let _ = win.window().show();
     anchor_by_title(title.to_string(), 10);
 }
 
@@ -392,6 +394,77 @@ fn find_win_by_title(title: &str, skip: &[isize]) -> Option<isize> {
             String::from_utf16_lossy(&tb[..tl.min(128)]) == title
         }
     })
+}
+
+/// Primary monitor work area in physical pixels (taskbar excluded); falls
+/// back to the whole screen when the query fails.
+fn work_area() -> (f64, f64, f64, f64) {
+    unsafe {
+        let mut wa = RECT::default();
+        if SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+        {
+            (
+                f64::from(wa.right - wa.left),
+                f64::from(wa.bottom - wa.top),
+                f64::from(wa.left),
+                f64::from(wa.top),
+            )
+        } else {
+            (
+                f64::from(GetSystemMetrics(SM_CXSCREEN)),
+                f64::from(GetSystemMetrics(SM_CYSCREEN)),
+                0.0,
+                0.0,
+            )
+        }
+    }
+}
+
+/// Centered top-left for the window's *outer* rect (GetWindowRect space, so
+/// title bar and invisible DWM borders are visually centered too).
+fn center_target(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r).ok()? };
+    let w = f64::from(r.right - r.left);
+    let h = f64::from(r.bottom - r.top);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let (aw, ah, ox, oy) = work_area();
+    Some((
+        (ox + (aw - w) / 2.0) as i32,
+        (oy + (ah - h) / 2.0) as i32,
+    ))
+}
+
+fn center_hwnd(hwnd: HWND) -> Option<(i32, i32)> {
+    let (x, y) = center_target(hwnd)?;
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    Some((x, y))
+}
+
+/// Center the main window once its native window is mapped (matched by title
+/// so the winit helper windows are never moved instead).
+fn center_main_when_mapped(title: String, retries: u8) {
+    Timer::single_shot(std::time::Duration::from_millis(60), move || {
+        if let Some(h) = find_win_by_title(&title, &[]) {
+            if let Some((x, y)) = center_hwnd(HWND(h as *mut core::ffi::c_void)) {
+                eprintln!("centered main \"{title}\" 0x{h:x} at ({x},{y})");
+                return;
+            }
+        }
+        if retries > 0 {
+            center_main_when_mapped(title, retries - 1);
+        }
+    });
 }
 
 fn fix_main_hwnd(title: String, retries: u8) {
@@ -414,13 +487,7 @@ fn anchor_by_title(title: String, retries: u8) {
         let mut tb = [0u16; 128];
         let mut found: Option<isize> = None;
         for h in self_windows() {
-            if h == owner
-                || ANCHORED
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .contains(&h)
-            {
+            if h == owner {
                 continue;
             }
             unsafe {
@@ -441,13 +508,47 @@ fn anchor_by_title(title: String, retries: u8) {
             }
             return;
         };
+        let hwnd = HWND(h as *mut core::ffi::c_void);
+        if ANCHORED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&h)
+        {
+            // Re-show of an already hooked window: update the pin *before* the
+            // move, else the hook would rewrite the move back to the old pin.
+            if let Some((x, y)) = center_target(hwnd) {
+                {
+                    let pm = PIN_MAP.get_or_init(Default::default);
+                    let mut g = pm.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(&(_, orig)) = g.get(&h) {
+                        g.insert(h, ([x, y], orig));
+                    }
+                }
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                eprintln!("re-center: \"{title}\" hwnd=0x{h:x} at ({x},{y})");
+            }
+            return;
+        }
+        // First mapping: center before the hook exists, so the pin below
+        // captures the centered position.
+        let _ = center_hwnd(hwnd);
         ANCHORED
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(h);
         unsafe {
-            let hwnd = HWND(h as *mut core::ffi::c_void);
             let prev = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
             let mut rc = RECT::default();
             if GetWindowRect(hwnd, &mut rc).is_ok() {
@@ -1395,7 +1496,7 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
         }
     };
     win.set_app_version(format!("Version RAMP v{}", env!("CARGO_PKG_VERSION")).into());
-    show_and_anchor(win.window(), TITLE_ABOUT);
+    show_and_anchor(&win, TITLE_ABOUT);
 }
 
 /// Open or re-show the update window. The first open starts a check right away
@@ -1421,7 +1522,7 @@ fn show_updates(app: &AppRc, ui: &Ui) {
     win.set_allow_major(app.borrow().cfg.upd_allow_major);
     let busy = app.borrow().upd_busy;
     win.set_busy(busy);
-    show_and_anchor(win.window(), TITLE_UPDATES);
+    show_and_anchor(&win, TITLE_UPDATES);
     if fresh {
         let app_w = app.clone();
         let ui_w = ui.clone();
@@ -2043,7 +2144,7 @@ fn show_file_window(app: &AppRc, ui: &Ui, kind: &str, idx: usize) {
         }
     };
     win.set_heading(heading.into());
-    show_and_anchor(win.window(), TITLE_FILES);
+    show_and_anchor(&win, TITLE_FILES);
 }
 
 fn show_settings_window(app: &AppRc, ui: &Ui) {
@@ -2093,7 +2194,7 @@ fn show_settings_window(app: &AppRc, ui: &Ui) {
         win.set_editor(cfg.editor.clone().into());
         win.set_browser(cfg.browser.clone().into());
     }
-    show_and_anchor(win.window(), TITLE_SETTINGS);
+    show_and_anchor(&win, TITLE_SETTINGS);
 }
 
 fn do_quit(app: &mut App, ui: &Ui) {
@@ -2514,6 +2615,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if direct.is_none() {
         fix_main_hwnd(mtitle, 10);
     }
+    // Center the main window once its native window is actually mapped.
+    center_main_when_mapped(TITLE_MAIN.to_string(), 15);
 
     // 500 ms timer: TimerUpdateStatus + TimerUpdateNetworking merged.
     let timer = Timer::default();
@@ -2990,6 +3093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TITLE_FILES,
             ];
             let mut ok = 0usize;
+            let mut rects: Vec<(&'static str, RECT)> = Vec::new();
             unsafe {
                 for want in expected {
                     let mut hwnd: Option<HWND> = None;
@@ -3033,6 +3137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = GetWindowRect(hwnd, &mut r1);
                     let pinned = hooked && r0.left == r1.left && r0.top == r1.top;
+                    rects.push((want, r0));
                     if owned && pinned {
                         ok += 1;
                     } else {
@@ -3062,6 +3167,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &ui_t,
                     "main",
                     &format!("TEST FAIL: {ok}/{} sub-windows anchored", expected.len()),
+                    LogType::Error,
+                );
+            }
+            // Centering check: every window's rect center must sit within
+            // 24 px of the primary work-area center.
+            let (aw, ah, ox, oy) = work_area();
+            let acx = ox + aw / 2.0;
+            let acy = oy + ah / 2.0;
+            let mut rmain = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(HWND(main_h as *mut core::ffi::c_void), &mut rmain);
+            }
+            let mut bad = 0usize;
+            let centered: Vec<(&str, RECT)> =
+                std::iter::once((TITLE_MAIN, rmain)).chain(rects.iter().map(|(w, r)| (*w, *r))).collect();
+            for (label, r) in centered {
+                let cx = f64::from(r.left + r.right) / 2.0;
+                let cy = f64::from(r.top + r.bottom) / 2.0;
+                if (cx - acx).abs() > 24.0 || (cy - acy).abs() > 24.0 {
+                    bad += 1;
+                    add_log(
+                        &mut a,
+                        &ui_t,
+                        "main",
+                        &format!(
+                            "\"{label}\" not centered: center=({cx:.0},{cy:.0}) want=({acx:.0},{acy:.0})"
+                        ),
+                        LogType::Error,
+                    );
+                }
+            }
+            if bad == 0 {
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    "TEST PASS: all 5 windows centered on work area",
+                    LogType::Info,
+                );
+            } else {
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    &format!("TEST FAIL: {bad} window(s) not centered"),
                     LogType::Error,
                 );
             }
