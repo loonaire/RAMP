@@ -3571,6 +3571,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "ramp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "slint",
+ "slint-build",
+ "windows",
+ "zip",
+]
+
+[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5565,18 +5577,6 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
-
-[[package]]
-name = "xampp-rs"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "sha2",
- "slint",
- "slint-build",
- "windows",
- "zip",
-]
 
 [[package]]
 name = "xattr"

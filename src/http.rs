@@ -13,7 +13,7 @@ pub fn widez(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-const UA: &str = "xampp-rs-updater/1.0";
+const UA: &str = "ramp-updater/1.0";
 
 pub struct Resp {
     pub status: u16,

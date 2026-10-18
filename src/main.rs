@@ -177,7 +177,7 @@ fn exe_stem() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|e| e.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "xampp-rs".into())
+        .unwrap_or_else(|| "ramp".into())
 }
 
 /// Port of TfMain.TryGuessXamppVersion: first line of readme_de.txt (fallback
@@ -1046,7 +1046,7 @@ fn sync_binary_name(app: &mut App, comp: update::Comp, exe: &str, ui: &Ui) {
         app,
         ui,
         "update",
-        &format!("BinaryNames in xampp-rs.ini: {old} -> {exe}"),
+        &format!("BinaryNames in ramp.ini: {old} -> {exe}"),
         LogType::Info,
     );
 }
@@ -1205,7 +1205,7 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
             w
         }
     };
-    win.set_app_version(format!("Version xampp-rs v{}", env!("CARGO_PKG_VERSION")).into());
+    win.set_app_version(format!("Version RAMP v{}", env!("CARGO_PKG_VERSION")).into());
     win.show().ok();
 }
 
@@ -1943,6 +1943,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stem = exe_stem();
     let ini_path = basedir.join(format!("{stem}.ini"));
     let log_path = basedir.join(format!("{stem}.log"));
+    // The project was named xampp-rs before becoming RAMP: carry the old
+    // per-exe config and log over when running under the new binary name.
+    if stem != "xampp-rs" {
+        let legacy_ini = basedir.join("xampp-rs.ini");
+        if !ini_path.exists() && legacy_ini.exists() {
+            let _ = std::fs::rename(&legacy_ini, &ini_path);
+        }
+        let legacy_log = basedir.join("xampp-rs.log");
+        if !log_path.exists() && legacy_log.exists() {
+            let _ = std::fs::rename(&legacy_log, &log_path);
+        }
+    }
     let cfg = config::Config::load(&ini_path);
 
     let modules = vec![
@@ -2069,7 +2081,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ui,
             "main",
             &format!(
-                "Control Panel Version: xampp-rs v{}",
+                "Control Panel Version: RAMP v{}",
                 env!("CARGO_PKG_VERSION")
             ),
             LogType::Default,
@@ -2301,7 +2313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Headless feed check: xampp-rs --update-check [--json]
+    // Headless feed check: ramp --update-check [--json]
     // GUI-subsystem binary: nothing is attached to stdout, so the result goes to
     // the log window and to the shared .log file.
     if args.iter().any(|a| a == "--update-check") {
@@ -2388,7 +2400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Headless apply: xampp-rs --update-apply <apache|mysql|php|pma> [line|version]
+    // Headless apply: ramp --update-apply <apache|mysql|php|pma> [line|version]
     if let Some(pos) = args.iter().position(|a| a == "--update-apply") {
         let want = args
             .get(pos + 1)
@@ -2512,7 +2524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Headless restore: xampp-rs --update-restore <apache|mysql|php|pma> [backup_dir]
+    // Headless restore: ramp --update-restore <apache|mysql|php|pma> [backup_dir]
     if let Some(pos) = args.iter().position(|a| a == "--update-restore") {
         let want = args
             .get(pos + 1)
@@ -2615,7 +2627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Hidden test mode: xampp-rs --test-cycle <apache|mysql|both> [hold_secs]
+    // Hidden test mode: ramp --test-cycle <apache|mysql|both> [hold_secs]
     if let Some(pos) = args.iter().position(|a| a == "--test-cycle") {
         let target = args.get(pos + 1).cloned().unwrap_or_else(|| "both".into());
         let hold: u64 = args.get(pos + 2).and_then(|s| s.parse().ok()).unwrap_or(6);
@@ -2694,7 +2706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Hidden maintenance: xampp-rs --patch-compat
+    // Hidden maintenance: ramp --patch-compat
     // Re-applies the Apache/PHP compatibility fixes to the current tree, then exits.
     if args.iter().any(|a| a == "--patch-compat") {
         let app_t = app.clone();

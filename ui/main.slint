@@ -20,7 +20,7 @@ export struct LogLine {
 }
 
 export component MainWindow inherits Window {
-    title: "XAMPP Control Panel";
+    title: "RAMP Control Panel";
     width: 710px;
     height: 480px;
 
@@ -63,7 +63,7 @@ export component MainWindow inherits Window {
         }
         Menu {
             title: "&Help";
-            MenuItem { title: "About xampp-rs..."; activated => { root.do_about(); } }
+            MenuItem { title: "About RAMP..."; activated => { root.do_about(); } }
         }
     }
 
@@ -81,7 +81,7 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
             Text {
-                text: "XAMPP Control Panel";
+                text: "RAMP Control Panel";
                 font-size: 15px;
                 font-weight: 600;
                 vertical-alignment: center;
@@ -467,7 +467,7 @@ export component FileWindow inherits Window {
 
 
 export component AboutWindow inherits Window {
-    title: "About XAMPP Control Panel";
+    title: "About RAMP Control Panel";
     preferred-width: 340px;
     preferred-height: 230px;
 
@@ -479,7 +479,7 @@ export component AboutWindow inherits Window {
         padding: 18px;
         spacing: 7px;
         Rectangle { horizontal-stretch: 1; }
-        Text { text: "XAMPP Control Panel"; font-size: 16px; font-weight: 600; horizontal-alignment: center; }
+        Text { text: "RAMP Control Panel"; font-size: 16px; font-weight: 600; horizontal-alignment: center; }
         Rectangle { height: 10px; }
         Text { text: root.app-version; horizontal-alignment: center; }
         Text { text: "by Loonaire"; horizontal-alignment: center; }
