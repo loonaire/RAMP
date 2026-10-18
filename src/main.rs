@@ -23,13 +23,15 @@ use windows::Win32::System::Threading::{
     NORMAL_PRIORITY_CLASS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_TERMINATE,
     STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetSystemMetrics, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    SetWindowLongPtrW, SetWindowPos, SHOW_WINDOW_CMD, SM_CXSCREEN, SM_CYSCREEN,
+    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetClientRect, GetSystemMetrics,
+    GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, SetWindowLongPtrW, SetWindowPos, SHOW_WINDOW_CMD, SM_CXSCREEN, SM_CYSCREEN,
     SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDPROC,
+    WS_BORDER, WS_CAPTION, WS_CLIPSIBLINGS, WS_EX_ACCEPTFILES, WS_EX_WINDOWEDGE, WS_SYSMENU,
     GWLP_HWNDPARENT, GWLP_WNDPROC, GW_OWNER, SystemParametersInfoW,
 };
 
@@ -379,6 +381,7 @@ const TITLE_FILES: &str = "RAMP Files";
 /// returns, so anchoring runs on a retry timer that matches the window by its
 /// title.
 fn show_and_anchor<W: ComponentHandle>(win: &Rc<W>, title: &str) {
+    pre_center(win, title);
     let _ = win.window().show();
     anchor_by_title(title.to_string(), 10);
 }
@@ -451,12 +454,121 @@ fn center_hwnd(hwnd: HWND) -> Option<(i32, i32)> {
     Some((x, y))
 }
 
+/// Frame-vs-client delta (title bar + borders + menu bar, physical px) for
+/// the windows winit creates: Slint marks fixed-size windows non-resizable,
+/// so the style is WS_CAPTION|WS_BORDER|WS_CLIPSIBLINGS|WS_SYSMENU (no
+/// invisible DWM resize border). The main window also carries a native menu
+/// bar (bmenu). Computed from system metrics; each mapped window title then
+/// calibrates the exact values (FDELTA).
+fn est_frame_delta(menu: bool) -> (i32, i32) {
+    unsafe {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if AdjustWindowRectExForDpi(
+            &mut r,
+            WS_CAPTION | WS_BORDER | WS_CLIPSIBLINGS | WS_SYSMENU,
+            menu,
+            WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES,
+            GetDpiForSystem(),
+        )
+        .is_ok()
+        {
+            (r.right - r.left, r.bottom - r.top)
+        } else {
+            if menu {
+                (16, 49) // caption + menu bar at 100% DPI
+            } else {
+                (16, 39)
+            }
+        }
+    }
+}
+
+static FDELTA: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i32, i32)>>> =
+    std::sync::OnceLock::new();
+
+/// Declared client sizes from ui/main.slint (physical px at 100% DPI; the
+/// main window's excludes the menu bar, like Slint's size() does). Used as a
+/// fallback because Slint's window().size() reads 0x0 before the first
+/// show(). The anchored-window test keeps these in sync with the .slint.
+fn declared_size(title: &str) -> Option<(i32, i32)> {
+    match title {
+        TITLE_MAIN => Some((710, 460)),
+        TITLE_SETTINGS => Some((480, 440)),
+        TITLE_UPDATES => Some((680, 430)),
+        TITLE_FILES => Some((520, 380)),
+        TITLE_ABOUT => Some((340, 230)),
+        _ => None,
+    }
+}
+
+/// Refine the frame delta per window title with the rects of a mapped
+/// window, so re-shown windows land exactly centered on the first mapping.
+fn calibrate_frame_delta(hwnd: HWND, title: &str) {
+    let map = FDELTA.get_or_init(Default::default);
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    if g.contains_key(title) {
+        return;
+    }
+    unsafe {
+        let mut wr = RECT::default();
+        let mut cr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_ok() && GetClientRect(hwnd, &mut cr).is_ok() {
+            let dx = (wr.right - wr.left) - (cr.right - cr.left);
+            let dy = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+            if dx > 0 && dy > 0 {
+                let est = est_frame_delta(title == TITLE_MAIN);
+                eprintln!(
+                    "frame delta \"{title}\" calibrated ({dx},{dy}), metrics estimate ({},{})",
+                    est.0, est.1
+                );
+                g.insert(title.to_string(), (dx, dy));
+            }
+        }
+    }
+}
+
+/// Put the window at its centered spot *before* show(): Slint keeps the
+/// position in the pending window attributes and winit applies it (SetWindowPos
+/// at WM_CREATE, outer-rect space) before the window is ever revealed, so the
+/// window never visibly jumps from its default spot to the center.
+fn pre_center<W: ComponentHandle>(win: &Rc<W>, title: &str) {
+    let (aw, ah, ox, oy) = work_area();
+    let cs = win.window().size();
+    let (cw, ch) = if cs.width > 0 && cs.height > 0 {
+        (cs.width as i32, cs.height as i32)
+    } else {
+        match declared_size(title) {
+            Some(s) => s,
+            None => return,
+        }
+    };
+    let (dx, dy) = FDELTA
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(title)
+        .copied()
+        .unwrap_or_else(|| est_frame_delta(title == TITLE_MAIN));
+    let x = (ox + (aw - (f64::from(cw) + f64::from(dx))) / 2.0) as i32;
+    let y = (oy + (ah - (f64::from(ch) + f64::from(dy))) / 2.0) as i32;
+    win.window().set_position(slint::PhysicalPosition::new(x, y));
+    eprintln!(
+        "pre-center \"{title}\" client={cw}x{ch} frame_delta=({dx},{dy}) -> ({x},{y})",
+    );
+}
+
 /// Center the main window once its native window is mapped (matched by title
 /// so the winit helper windows are never moved instead).
 fn center_main_when_mapped(title: String, retries: u8) {
     Timer::single_shot(std::time::Duration::from_millis(60), move || {
         if let Some(h) = find_win_by_title(&title, &[]) {
             if let Some((x, y)) = center_hwnd(HWND(h as *mut core::ffi::c_void)) {
+                calibrate_frame_delta(HWND(h as *mut core::ffi::c_void), &title);
                 eprintln!("centered main \"{title}\" 0x{h:x} at ({x},{y})");
                 return;
             }
@@ -543,6 +655,7 @@ fn anchor_by_title(title: String, retries: u8) {
         // First mapping: center before the hook exists, so the pin below
         // captures the centered position.
         let _ = center_hwnd(hwnd);
+        calibrate_frame_delta(hwnd, &title);
         ANCHORED
             .get_or_init(Default::default)
             .lock()
@@ -2578,6 +2691,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CloseRequestResponse::HideWindow
     });
 
+    // Map directly at the centered position (see pre_center); the retry timer
+    // below only verifies/refines, so the window never visibly jumps.
+    pre_center(&main_window, TITLE_MAIN);
     main_window.show()?;
     // Remember the main window's HWND: every sub-window is anchored onto it.
     // Slint maps the native HWND shortly after show() and the process also owns
