@@ -1,0 +1,3 @@
+[build]
+# Le dossier target/ d'origine contient des exécutables verrouillés par l'antivirus
+target-dir = "../xtarget"

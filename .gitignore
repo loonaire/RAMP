@@ -1,0 +1,4 @@
+# Artefacts de build (le vrai target est ../xtarget via .cargo/config.toml)
+/target/
+/xtarget/
+*.log
