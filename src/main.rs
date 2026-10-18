@@ -2305,6 +2305,7 @@ fn refresh_and_update(app: &mut App, ui: &Ui) {
 }
 
 fn sync_modules(app: &App, ui: &Ui) {
+    let mut widest = 0usize;
     for (i, m) in app.modules.iter().enumerate() {
         let (bg, fg, label) = if m.error && !m.running {
             (BG_ERROR, FG_ERROR, "ERROR")
@@ -2315,6 +2316,8 @@ fn sync_modules(app: &App, ui: &Ui) {
         } else {
             (BG_STOPPED, FG_STOPPED, "STOPPED")
         };
+        let ports = module_ports(app, m);
+        widest = widest.max(ports.chars().count());
         ui.mod_model.set_row_data(
             i,
             ModuleInfo {
@@ -2326,7 +2329,7 @@ fn sync_modules(app: &App, ui: &Ui) {
                     .collect::<Vec<_>>()
                     .join(", ")
                     .into(),
-                port_text: module_ports(app, m).into(),
+                port_text: ports.into(),
                 status_brush: brush(bg),
                 status_text: label.into(),
                 status_fg: brush(fg),
@@ -2335,6 +2338,13 @@ fn sync_modules(app: &App, ui: &Ui) {
                 start_enabled: true,
             },
         );
+    }
+    // A 12px digit is about 6.8px wide; 56px is the "PORT(S)" header, so the
+    // column never gets narrower than its own label. The status pill then sits
+    // right behind the numbers instead of 70px further along the row.
+    let want = (12.0 + widest as f32 * 6.8).clamp(56.0, 150.0);
+    if ui.main.get_port_col_width() != want {
+        ui.main.set_port_col_width(want);
     }
 }
 

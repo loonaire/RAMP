@@ -28,6 +28,10 @@ export component MainWindow inherits Window {
     in property <[LogLine]> logs;
     in property <string> basedir;
 
+    // The ports column only ever holds "80, 443", so a fixed 120px left a hole
+    // before the status pill. Rust sizes it to the widest list it has to show.
+    in property <length> port-col-width: 66px;
+
     in property <string> update-badge;
     in property <bool> update-busy;
 
@@ -87,7 +91,7 @@ export component MainWindow inherits Window {
                         spacing: 6px;
                         Text { width: 100px; text: "MODULE"; color: #8a8f98; font-size: 10px; }
                         Text { width: 80px; text: "PID(S)"; color: #8a8f98; font-size: 10px; }
-                        Text { width: 120px; text: "PORT(S)"; color: #8a8f98; font-size: 10px; }
+                        Text { width: root.port-col-width; text: "PORT(S)"; color: #8a8f98; font-size: 10px; }
                         Text { width: 80px; text: "STATUS"; color: #8a8f98; font-size: 10px; horizontal-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                     }
@@ -105,7 +109,7 @@ export component MainWindow inherits Window {
                         spacing: 6px;
                         Text { width: 100px; text: m.name; font-size: 14px; vertical-alignment: center; }
                         Text { width: 80px; text: m.pid_text; font-size: 12px; color: #c8ccd4; vertical-alignment: center; }
-                        Text { width: 120px; text: m.port_text; font-size: 12px; color: #c8ccd4; vertical-alignment: center; }
+                        Text { width: root.port-col-width; text: m.port_text; font-size: 12px; color: #c8ccd4; vertical-alignment: center; }
                         Rectangle {
                             width: 80px;
                             height: 22px;
@@ -134,10 +138,10 @@ export component MainWindow inherits Window {
                                 }
                             }
                         }
-                        Button { text: m.action_text; height: 24px; enabled: m.start_enabled; clicked => { root.start_stop(idx); } }
-                        Button { text: "Admin"; height: 24px; enabled: m.admin_enabled; clicked => { root.admin(idx); } }
-                        Button { text: "Config"; height: 24px; clicked => { root.open_config(idx); } }
-                        Button { text: "Logs"; height: 24px; clicked => { root.open_logs(idx); } }
+                        Button { text: m.action_text; width: 68px; height: 24px; enabled: m.start_enabled; clicked => { root.start_stop(idx); } }
+                        Button { text: "Admin"; width: 68px; height: 24px; enabled: m.admin_enabled; clicked => { root.admin(idx); } }
+                        Button { text: "Config"; width: 68px; height: 24px; clicked => { root.open_config(idx); } }
+                        Button { text: "Logs"; width: 68px; height: 24px; clicked => { root.open_logs(idx); } }
                         Rectangle { horizontal-stretch: 1; }
                     }
                 }
