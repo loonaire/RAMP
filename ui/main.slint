@@ -447,6 +447,38 @@ export component FileWindow inherits Window {
 
 
 
+export component DepWindow inherits Window {
+    title: "Missing libraries";
+    width: 480px;
+    height: 220px;
+
+    in property <string> headline;
+    in property <string> details;
+    in property <string> link-text;
+
+    callback open_link();
+    callback close_it();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 9px;
+        Text { text: root.headline; font-size: 15px; font-weight: 600; }
+        Text { text: root.details; wrap: word-wrap; }
+        Rectangle { horizontal-stretch: 1; }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 10px;
+            Button {
+                text: "Download";
+                visible: root.link-text != "";
+                enabled: root.link-text != "";
+                clicked => { root.open_link(); }
+            }
+            Button { text: "Close"; clicked => { root.close_it(); } }
+        }
+    }
+}
+
 export component AboutWindow inherits Window {
     title: "About RAMP Control Panel";
     width: 340px;

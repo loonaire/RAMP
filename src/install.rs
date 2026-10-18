@@ -13,7 +13,7 @@
 //! Everything runs on a worker thread (or under --first-run): it blocks for
 //! minutes while archives download and MariaDB seeds its datadir.
 
-use crate::update::{self, Comp, Info, Ver};
+use crate::update::{self, Comp, Info};
 use std::{
     fs,
     io::Write,
@@ -88,6 +88,52 @@ fn write_text(p: &Path, text: &str) -> Result<(), String> {
 
 fn find_in(root: &Path, names: &[&str]) -> Option<PathBuf> {
     names.iter().map(|n| root.join(n)).find(|p| p.is_file())
+}
+
+/// The PHP runtime and Apache module this tree really contains, by file name:
+/// `php8ts` + `php8apache2_4`, or `php8` + ... for a non thread safe build.
+/// A version string would be a guess, and the guess is what LoadFile has to
+/// match exactly.
+pub(crate) fn php_dlls(basedir: &Path) -> (String, String) {
+    let mut rt = String::new();
+    let mut md = String::new();
+    if let Ok(rd) = fs::read_dir(basedir.join("php")) {
+        let mut names: Vec<String> = Vec::new();
+        for e in rd.flatten() {
+            names.push(e.file_name().to_string_lossy().to_lowercase());
+        }
+        names.sort();
+        for n in names {
+            let Some(rest) = n.strip_prefix("php") else { continue };
+            if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            let stem = rest.trim_end_matches(".dll");
+            if md.is_empty() && stem.ends_with("apache2_4") {
+                md = format!("php{stem}");
+            } else if rt.is_empty() && (stem.ends_with("ts") || stem.chars().all(|c| c.is_ascii_digit())) {
+                rt = format!("php{stem}");
+            }
+        }
+    }
+    if rt.is_empty() {
+        rt = "php8ts".into();
+    }
+    if md.is_empty() {
+        md = format!("{}apache2_4", rt.trim_end_matches("ts").to_string());
+    }
+    (rt, md)
+}
+
+/// True when the Apache configuration already names the PHP libraries that are
+/// on disk: catches a PHP major/minor change and an NTS-vs-ZTS mismatch.
+fn php_wiring_current(basedir: &Path) -> bool {
+    let Ok(txt) = fs::read_to_string(basedir.join("apache\\conf\\extra\\httpd-xampp.conf")) else {
+        return false;
+    };
+    let lower = txt.to_lowercase().replace('\\', "/");
+    let (rt, md) = php_dlls(basedir);
+    lower.contains(&format!("/{rt}.dll\"")) && lower.contains(&format!("/{md}.dll\""))
 }
 
 // ------------------------------------------------------------------- helpers
@@ -448,15 +494,16 @@ fn conf_references_missing(basedir: &Path) -> bool {
 fn write_apache_conf(
     basedir: &Path,
     port: u16,
-    php_major: u32,
     log: &mut dyn FnMut(String, bool),
 ) -> Result<(), String> {
+    let (rt, md) = php_dlls(basedir);
     let map = [
         ("@SRVROOT@", fwd(&basedir.join("apache"))),
         ("@ROOT@", fwd(basedir)),
         ("@ROOTBS@", doubled(basedir)),
         ("@APORT@", port.to_string()),
-        ("@PHPMAJOR@", php_major.to_string()),
+        ("@PHPRT@", rt),
+        ("@PHPMOD@", md),
     ];
     // The Apache archive ships a conf/httpd.conf with c:/Apache24 baked in. A
     // first install replaces it: DocumentRoot must land outside the Apache tree,
@@ -633,13 +680,33 @@ fn verify_running(
     o: &Opts,
     apache_exe: &str,
     mysql_exe: &str,
+    start_mysql: bool,
+    start_apache: bool,
     log: &mut dyn FnMut(String, bool),
 ) -> Result<(), String> {
     use crate::{http::http_get, start_module_blocking, stop_module_blocking};
-    log("verification: starting MariaDB and Apache".into(), false);
+    let what: Vec<&str> = [
+        if start_mysql { Some("MariaDB") } else { None },
+        if start_apache { Some("Apache") } else { None },
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    log(
+        if what.is_empty() {
+            "verification: both servers are already up, probing only".into()
+        } else {
+            format!("verification: starting {}", what.join(" and "))
+        },
+        false,
+    );
     let r = (|| -> Result<(), String> {
-        start_module_blocking(basedir, "MariaDB", mysql_exe)?;
-        start_module_blocking(basedir, "Apache", apache_exe)?;
+        if start_mysql {
+            start_module_blocking(basedir, "MariaDB", mysql_exe)?;
+        }
+        if start_apache {
+            start_module_blocking(basedir, "Apache", apache_exe)?;
+        }
         let url = format!("http://127.0.0.1:{}/phpmyadmin/", o.apache_port);
         let resp = http_get(&url).map_err(|e| format!("{url}: {e}"))?;
         if resp.status >= 400 {
@@ -655,9 +722,19 @@ fn verify_running(
         );
         Ok(())
     })();
-    // Only what this function started is taken down again; the panel will not
-    // have had a chance to start anything else while the worker was busy.
-    stop_module_blocking(&[o.apache_port, o.mysql_port]);
+    // Only what this function started is taken down again: a server the user
+    // brought up from the panel stays up, and the panel will not have had a
+    // chance to start anything else while the worker was busy.
+    let mut stop: Vec<u16> = Vec::new();
+    if start_mysql {
+        stop.push(o.mysql_port);
+    }
+    if start_apache {
+        stop.push(o.apache_port);
+    }
+    if !stop.is_empty() {
+        stop_module_blocking(&stop);
+    }
     r
 }
 
@@ -672,6 +749,21 @@ fn port_free(port: u16) -> bool {
         .any(|e| e.local == port && e.state == 2)
 }
 
+/// The process holding `port` when that process runs out of this very package:
+/// such a server belongs to this installation and may be reused, one from
+/// another tree may not be disturbed.
+fn own_listener(basedir: &Path, port: u16) -> Option<u32> {
+    let root = basedir.to_string_lossy().to_lowercase().trim_end_matches(['\\', '/']).to_string();
+    crate::netstat::tcp_table()
+        .iter()
+        .filter(|e| e.local == port && e.state == 2)
+        .map(|e| e.pid)
+        .find(|pid| {
+            let p = crate::procs::process_path(*pid).to_lowercase();
+            p.starts_with(&root) && p[root.len()..].starts_with(['\\', '/'])
+        })
+}
+
 // ---------------------------------------------------------------- top level
 
 /// True when an installed tree carries configuration that cannot work here:
@@ -684,7 +776,10 @@ pub fn needs_repair(basedir: &Path) -> bool {
             || conf_references_missing(basedir));
     let mysql =
         update::installed_opt(basedir, Comp::Mysql).is_some() && outside_root(basedir, "mysql\\bin\\my.ini");
-    apache || mysql
+    let php_wiring = update::installed_opt(basedir, Comp::Apache).is_some()
+        && update::installed_opt(basedir, Comp::Php).is_some()
+        && !php_wiring_current(basedir);
+    apache || mysql || php_wiring
 }
 
 /// Install every component that is still missing, in dependency order, then
@@ -746,8 +841,7 @@ pub fn bootstrap(
             }
             Comp::Apache => {
                 boot.apache_exe = exe;
-                let major = Ver::parse(&info.available).map(|v| v.0[0]).unwrap_or(8);
-                write_apache_conf(basedir, o.apache_port, major, log)?;
+                write_apache_conf(basedir, o.apache_port, log)?;
                 for d in ["apache\\logs", "cgi-bin", "htdocs"] {
                     mkdir(&basedir.join(d))?;
                 }
@@ -797,17 +891,22 @@ pub fn bootstrap(
         let moved = basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file()
             && (outside_root(basedir, "apache\\conf\\httpd.conf")
                 || outside_root(basedir, "apache\\conf\\extra\\httpd-xampp.conf"));
-        if !basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file() || broken_includes || moved {
+        let php_wiring = !php_wiring_current(basedir);
+        if !basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file()
+            || broken_includes
+            || moved
+            || php_wiring
+        {
             if broken_includes {
                 log("httpd.conf includes files this Apache build does not ship: rewriting it".into(), true);
             }
             if moved {
                 log("httpd.conf still named another installation: rewritten".into(), true);
             }
-            let major = update::installed_opt(basedir, Comp::Php)
-                .map(|v| v.0[0])
-                .unwrap_or(8);
-            write_apache_conf(basedir, o.apache_port, major, log)?;
+            if php_wiring {
+                log("the PHP libraries named in httpd-xampp.conf are not the ones on disk: rewriting it".into(), true);
+            }
+            write_apache_conf(basedir, o.apache_port, log)?;
         }
         // The configuration ships with https enabled, so it needs a certificate.
         if !basedir.join("apache\\conf\\ssl.crt\\server.crt").is_file() {
@@ -841,14 +940,18 @@ pub fn bootstrap(
         && update::installed_opt(basedir, Comp::Phpmyadmin).is_some()
         && update::installed_opt(basedir, Comp::Mysql).is_some()
     {
-        if !port_free(o.mysql_port) {
+        let ours = own_listener(basedir, o.mysql_port);
+        if !port_free(o.mysql_port) && ours.is_none() {
             log(
                 format!(
-                    "port {} is already in use, so MariaDB cannot be started to seed phpMyAdmin: start it yourself and import phpMyAdmin/sql/create_tables.sql",
+                    "port {} is held by a MariaDB from somewhere else, so seeding was left alone: start this package's MariaDB yourself and import phpMyAdmin/sql/create_tables.sql",
                     o.mysql_port
                 ),
                 true,
             );
+        } else if ours.is_some() {
+            // The panel's own MariaDB is already up: seed it where it stands.
+            seed_pmadb(basedir, o.mysql_port, log)?;
         } else {
             // Seeding needs a live server: start MariaDB, seed it, hand the port back.
             crate::start_module_blocking(basedir, "MariaDB", &boot.mysql_exe)
@@ -860,16 +963,28 @@ pub fn bootstrap(
     }
 
     if o.verify {
-        if !port_free(o.apache_port) || !port_free(o.mysql_port) {
+        let our_mysql = own_listener(basedir, o.mysql_port);
+        let our_apache = own_listener(basedir, o.apache_port);
+        if (!port_free(o.apache_port) && our_apache.is_none())
+            || (!port_free(o.mysql_port) && our_mysql.is_none())
+        {
             log(
                 format!(
-                    "verification skipped: port {} or {} is already in use",
+                    "verification skipped: port {} or {} is held by a server this panel did not start",
                     o.apache_port, o.mysql_port
                 ),
                 true,
             );
         } else {
-            verify_running(basedir, o, &boot.apache_exe, &boot.mysql_exe, log)?;
+            verify_running(
+                basedir,
+                o,
+                &boot.apache_exe,
+                &boot.mysql_exe,
+                our_mysql.is_none(),
+                our_apache.is_none(),
+                log,
+            )?;
         }
     }
     log("installation complete".into(), false);

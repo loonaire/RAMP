@@ -2,6 +2,7 @@ mod config;
 mod http;
 mod install;
 mod netstat;
+mod pe;
 mod procs;
 mod update;
 
@@ -96,6 +97,7 @@ struct App {
     settings_win: Option<Rc<ConfigWindow>>,
     upd_win: Option<Rc<UpdateWindow>>,
     about_win: Option<Rc<AboutWindow>>,
+    dep_win: Option<Rc<DepWindow>>,
     upd_model: Rc<VecModel<UpdateInfo>>,
     upd_info: Vec<Vec<update::Info>>,
     upd_sel: Vec<usize>,
@@ -375,6 +377,10 @@ const TITLE_MAIN: &str = "RAMP Control Panel";
 const TITLE_SETTINGS: &str = "Settings";
 const TITLE_UPDATES: &str = "Component Updates";
 const TITLE_ABOUT: &str = "About RAMP Control Panel";
+const TITLE_DEPS: &str = "Missing libraries";
+
+/// The one page Microsoft keeps current for the x64 VC++ runtime.
+const VC_REDIST_X64: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
 const TITLE_FILES: &str = "RAMP Files";
 
 /// Show a sub-window, then anchor it on the main window (owned: no taskbar
@@ -503,6 +509,7 @@ fn declared_size(title: &str) -> Option<(i32, i32)> {
         TITLE_UPDATES => Some((680, 430)),
         TITLE_FILES => Some((520, 380)),
         TITLE_ABOUT => Some((340, 230)),
+        TITLE_DEPS => Some((480, 220)),
         _ => None,
     }
 }
@@ -1716,6 +1723,158 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
     show_and_anchor(&win, TITLE_ABOUT);
 }
 
+/// ---------------------------------------------------------------- dependencies
+
+/// True for the libraries the Visual C++ Redistributable owns: those are the
+/// ones a plain Windows install may genuinely lack.
+fn is_vc_runtime(dll: &str) -> bool {
+    let d = dll.to_ascii_lowercase();
+    d.starts_with("vcruntime")
+        || d.starts_with("msvcp")
+        || d.starts_with("vccorlib")
+        || d.starts_with("msvcr")
+        || d.starts_with("ucrtbase")
+}
+
+/// Direct imports of the binaries this panel is about to start, that exist
+/// neither in the package nor in System32. Api-set entries (`api-ms-win-*`) are
+/// resolved by the loader itself and are not files, so they stay out of the way.
+fn dependency_gaps(basedir: &Path) -> Vec<(String, String)> {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
+    let mut dirs: Vec<PathBuf> = vec![
+        basedir.join("apache\\bin"),
+        basedir.join("php"),
+        basedir.join("mysql\\bin"),
+        basedir.to_path_buf(),
+        PathBuf::from(sysroot).join("System32"),
+    ];
+    dirs.retain(|d| d.is_dir());
+
+    let (rt, md) = install::php_dlls(basedir);
+    let wanted: [(&str, PathBuf); 5] = [
+        ("apache\\bin\\httpd.exe", basedir.join("apache\\bin\\httpd.exe")),
+        ("php\\php.exe", basedir.join("php\\php.exe")),
+        (
+            "php\\<runtime>",
+            basedir.join(format!("php\\{rt}.dll")),
+        ),
+        (
+            "php\\<apache module>",
+            basedir.join(format!("php\\{md}.dll")),
+        ),
+        ("mysql\\bin\\mariadbd.exe", basedir.join("mysql\\bin\\mariadbd.exe")),
+    ];
+    let mut gaps: Vec<(String, String)> = Vec::new();
+    for (who, path) in wanted {
+        if !path.is_file() {
+            continue;
+        }
+        for dll in pe::imports(&path) {
+            let base = dll
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&dll)
+                .to_ascii_lowercase();
+            if base.is_empty() || base.starts_with("api-ms-win") || base.starts_with("ext-ms-") {
+                continue;
+            }
+            if dirs.iter().any(|d| d.join(&base).is_file()) {
+                continue;
+            }
+            if !gaps.iter().any(|(n, _)| *n == base) {
+                gaps.push((base, who.to_string()));
+            }
+        }
+    }
+    gaps
+}
+
+/// Tell the user about it instead of letting Apache die in silence: the panel
+/// cannot install a system runtime itself, but it can hand over the link.
+fn check_dependencies(app: &AppRc, ui: &Ui) {
+    let gaps = {
+        let a = app.borrow();
+        dependency_gaps(&a.basedir)
+    };
+    if gaps.is_empty() {
+        return;
+    }
+    let list = gaps
+        .iter()
+        .map(|(d, w)| format!("{d} ({w})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    add_log(
+        &mut app.borrow_mut(),
+        ui,
+        "main",
+        &format!("missing libraries: {list}"),
+        LogType::Error,
+    );
+    let vc = gaps.iter().any(|(d, _)| is_vc_runtime(d));
+    show_dep_window(app, &gaps, vc);
+}
+
+fn show_dep_window(app: &AppRc, gaps: &[(String, String)], vc: bool) {
+    let win = {
+        let mut a = app.borrow_mut();
+        if let Some(w) = a.dep_win.clone() {
+            w
+        } else {
+            let Ok(w) = DepWindow::new() else { return };
+            let w = Rc::new(w);
+            let wc = w.clone();
+            w.on_close_it(move || {
+                let _ = wc.hide();
+            });
+            w.window()
+                .on_close_requested(|| CloseRequestResponse::HideWindow);
+            a.dep_win = Some(w.clone());
+            w
+        }
+    };
+    let names: Vec<&str> = gaps.iter().take(4).map(|(d, _)| d.as_str()).collect();
+    let joined = names.join(", ");
+    let more = if gaps.len() > 4 {
+        format!(" and {} more", gaps.len() - 4)
+    } else {
+        String::new()
+    };
+    let who = gaps
+        .first()
+        .map(|(_, w)| w.as_str())
+        .unwrap_or("a component");
+    if vc {
+        win.set_headline("A Windows component is missing".into());
+        win.set_details(
+            format!(
+                "{joined}{more} is needed by {who}, and is neither in this package nor in Windows. \
+                 Those libraries belong to the Microsoft Visual C++ Redistributable (x64): install \
+                 it, then start RAMP again. Apache and PHP will not run without it."
+            )
+            .into(),
+        );
+        win.set_link_text("Download the Visual C++ Redistributable (x64)".into());
+    } else {
+        win.set_headline(format!("A library is missing: {joined}").into());
+        win.set_details(
+            format!(
+                "{joined}{more}, needed by {who}, cannot be found in this package or in Windows. \
+                 That installation is incomplete: open the update window and reinstall the component."
+            )
+            .into(),
+        );
+        win.set_link_text("".into());
+    }
+    let url = if vc { VC_REDIST_X64.to_string() } else { String::new() };
+    win.on_open_link(move || {
+        if !url.is_empty() {
+            let _ = shell_open(&url, "open");
+        }
+    });
+    show_and_anchor(&win, TITLE_DEPS);
+}
+
 /// Open or re-show the update window. The first open starts a check right away
 /// so the user never has to press twice.
 fn show_updates(app: &AppRc, ui: &Ui) {
@@ -2506,6 +2665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings_win: None,
         upd_win: None,
         about_win: None,
+        dep_win: None,
         upd_model: Rc::new(VecModel::default()),
         upd_info: Vec::new(),
         upd_sel: Vec::new(),
@@ -2864,10 +3024,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A completely empty package installs itself once the window is up, unless
     // a CLI mode is driving.
     if args.len() <= 1 {
+        let app_dp = app.clone();
+        let ui_dp = ui.clone();
+        Timer::single_shot(std::time::Duration::from_millis(400), move || {
+            check_dependencies(&app_dp, &ui_dp);
+        });
         let app_fr = app.clone();
         let ui_fr = ui.clone();
         Timer::single_shot(std::time::Duration::from_millis(800), move || {
             start_first_run(&app_fr, &ui_fr);
+        });
+    }
+
+    // Hidden test mode: ramp --deps-check (report what will not load, then leave)
+    if args.iter().any(|a| a == "--deps-check") {
+        let app_t = app.clone();
+        let ui_t = ui.clone();
+        Timer::single_shot(std::time::Duration::from_millis(600), move || {
+            let gaps = {
+                let a = app_t.borrow();
+                dependency_gaps(&a.basedir)
+            };
+            let mut a = app_t.borrow_mut();
+            if gaps.is_empty() {
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    "dependency check: every library resolved",
+                    LogType::Info,
+                );
+            } else {
+                let list = gaps
+                    .iter()
+                    .map(|(d, w)| format!("{d} ({w})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "main",
+                    &format!("dependency check: {} unresolved: {list}", gaps.len()),
+                    LogType::Error,
+                );
+            }
+            do_quit(&mut a, &ui_t);
         });
     }
 
@@ -3371,6 +3572,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         show_updates(&app_t, &ui_t);
         show_about_window(&app_t, &ui_t);
         show_file_window(&app_t, &ui_t, "config", 0);
+        show_dep_window(
+            &app_t,
+            &[("vcruntime140.dll".to_string(), "apache\\bin\\httpd.exe".to_string())],
+            true,
+        );
             });
             let app_t = app.clone();
             let ui_t = ui.clone();
@@ -3391,6 +3597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TITLE_UPDATES,
                 TITLE_ABOUT,
                 TITLE_FILES,
+                TITLE_DEPS,
             ];
             let mut ok = 0usize;
             let mut rects: Vec<(&'static str, RECT)> = Vec::new();
