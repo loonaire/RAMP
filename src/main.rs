@@ -192,35 +192,6 @@ fn exe_stem() -> String {
         .unwrap_or_else(|| "ramp".into())
 }
 
-/// Port of TfMain.TryGuessXamppVersion: first line of readme_de.txt (fallback
-/// readme_en.txt) containing "version X.Y.Z" or "... portable X.Y.Z Portable".
-fn guess_xampp_version(basedir: &Path) -> String {
-    for name in ["readme_de.txt", "readme_en.txt"] {
-        let Ok(text) = std::fs::read_to_string(basedir.join(name)) else {
-            continue;
-        };
-        let first = text.lines().next().unwrap_or("").to_lowercase();
-        if let Some(p) = first.find("version") {
-            let rest = &first[(p + 8).min(first.len())..];
-            if let Some(sp) = rest.find(' ') {
-                let v = rest[..sp].trim();
-                if !v.is_empty() {
-                    return v.to_string();
-                }
-            }
-        } else if let Some(p) = first.find("portable") {
-            let rest = &first[(p + 9).min(first.len())..];
-            if let Some(sp) = rest.find(' ') {
-                let v = rest[..sp].trim();
-                if !v.is_empty() {
-                    return format!("{v} Portable");
-                }
-            }
-        }
-    }
-    "???".into()
-}
-
 // ---------------------------------------------------------------- process helpers
 
 unsafe fn create_process(
@@ -2759,13 +2730,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ui,
             "main",
             &format!("Windows Version: {}", windows_version()),
-            LogType::Default,
-        );
-        add_log(
-            &mut a,
-            &ui,
-            "main",
-            &format!("XAMPP Version: {}", guess_xampp_version(&basedir)),
             LogType::Default,
         );
         add_log(
