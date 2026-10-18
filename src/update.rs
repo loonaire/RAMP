@@ -249,8 +249,15 @@ fn human_size(s: &str) -> u64 {
         .unwrap_or(0)
 }
 
-pub fn feed_php(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> {
-    let cur = installed_version(basedir, Comp::Php)?;
+pub fn installed_opt(basedir: &Path, comp: Comp) -> Option<Ver> {
+    installed_version(basedir, comp).ok()
+}
+
+/// `cur` = installed version; `None` means the component is not installed at all
+/// (first-run bootstrap): every published build is then a candidate and the
+/// newest one is the pick.
+pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, String> {
+    let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
     let txt = http::http_get_text(PHP_JSON)?;
     let val: serde_json::Value =
         serde_json::from_str(&txt).map_err(|e| format!("releases.json PHP: {e}"))?;
@@ -264,11 +271,13 @@ pub fn feed_php(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> 
         else {
             continue;
         };
-        if !ver_cmp(&v, &cur).is_gt() {
-            continue;
-        }
-        if !allow_major && !v.same_line(&cur) {
-            continue;
+        if let Some(c) = cur {
+            if !ver_cmp(&v, c).is_gt() {
+                continue;
+            }
+            if !allow_major && !v.same_line(c) {
+                continue;
+            }
         }
         // XAMPP ships ZTS PHP (mod_php); "ts-vsNN-x64" is the matching flavour.
         let flavors: Vec<&serde_json::Value> = e
@@ -301,7 +310,7 @@ pub fn feed_php(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> 
             v.clone(),
             Info {
                 comp: Comp::Php,
-                installed: cur.show(),
+                installed: shown.clone(),
                 available: v.show(),
                 url: format!("{PHP_BASE}/{path}"),
                 file: path.to_string(),
@@ -317,8 +326,8 @@ pub fn feed_php(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> 
     Ok(out.into_iter().map(|(_, i)| i).collect())
 }
 
-pub fn feed_apache(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> {
-    let cur = installed_version(basedir, Comp::Apache)?;
+pub fn feed_apache(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, String> {
+    let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
     let html = http::http_get_text(AL_PAGE)?;
     let found = scan_apachelounge(&html);
     if found.is_empty() {
@@ -326,8 +335,10 @@ pub fn feed_apache(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, Strin
     }
     let mut cands: Vec<(Ver, String)> = found
         .into_iter()
-        .filter(|(v, _)| ver_cmp(v, &cur).is_gt())
-        .filter(|(v, _)| allow_major || v.same_line(&cur))
+        .filter(|(v, _)| match cur {
+            Some(c) => ver_cmp(v, c).is_gt() && (allow_major || v.same_line(c)),
+            None => true,
+        })
         .collect();
     // A version re-cut on a newer date: keep the newest build per version.
     cands.sort_by(|a, b| ver_cmp(&b.0, &a.0).then_with(|| b.1.cmp(&a.1)));
@@ -343,7 +354,7 @@ pub fn feed_apache(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, Strin
         }
         out.push(Info {
             comp: Comp::Apache,
-            installed: cur.show(),
+            installed: shown.clone(),
             available: v.show(),
             url: format!("{AL_BASE}/{name}"),
             file: name,
@@ -450,11 +461,11 @@ fn parse_sha256_sidecar(txt: &str) -> Option<String> {
 }
 
 pub fn feed_mariadb(
-    basedir: &Path,
+    cur: Option<&Ver>,
     allow_major: bool,
     target_line: &str,
 ) -> Result<Vec<Info>, String> {
-    let cur = installed_version(basedir, Comp::Mysql)?;
+    let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
     let txt = http::http_get_text(MDB_API)?;
     let val: serde_json::Value =
         serde_json::from_str(&txt).map_err(|e| format!("rest-api: {e}"))?;
@@ -514,12 +525,14 @@ pub fn feed_mariadb(
     // An explicit target line pins the list; otherwise every line above the
     // installed one (when major jumps are allowed) plus the installed line for
     // patch updates.
-    let cur_line = format!("{}.{}", cur.0[0], cur.0[1]);
+    let cur_line = cur
+        .map(|c| format!("{}.{}", c.0[0], c.0[1]))
+        .unwrap_or_default();
     let target = target_line.trim();
     let wanted: Vec<&Line> = if !target.is_empty() {
         lines.iter().filter(|l| l.id == target).collect()
-    } else {
-        let base = Ver([cur.0[0], cur.0[1], 0, 0]);
+    } else if let Some(c) = cur {
+        let base = Ver([c.0[0], c.0[1], 0, 0]);
         lines
             .iter()
             .filter(|l| {
@@ -527,11 +540,23 @@ pub fn feed_mariadb(
                 l.id == cur_line || (allow_major && above)
             })
             .collect()
+    } else {
+        // Fresh install: pin it on an LTS line, never on a rolling or preview one.
+        let lts: Vec<&Line> = lines.iter().filter(|l| l.status == "LTS").collect();
+        if lts.is_empty() {
+            lines.iter().collect()
+        } else {
+            lts
+        }
     };
     if wanted.is_empty() {
         return Err(format!(
             "MariaDB {} is no longer in the release lines (available: {})",
-            cur.show(),
+            if cur.is_some() {
+                shown.as_str()
+            } else {
+                target
+            },
             seen.join(", ")
         ));
     }
@@ -553,8 +578,10 @@ pub fn feed_mariadb(
         let mut best: Option<(Ver, String, String, String, u64)> = None;
         for (rid, r) in rels {
             let Some(rv) = Ver::parse(rid) else { continue };
-            if !ver_cmp(&rv, &cur).is_gt() {
-                continue;
+            if let Some(c) = cur {
+                if !ver_cmp(&rv, c).is_gt() {
+                    continue;
+                }
             }
             let files = match r.get("files").and_then(|f| f.as_array()) {
                 Some(f) => f,
@@ -605,7 +632,7 @@ pub fn feed_mariadb(
                 rv.clone(),
                 Info {
                     comp: Comp::Mysql,
-                    installed: cur.show(),
+                    installed: shown.clone(),
                     available: rv.show(),
                     url,
                     file: name,
@@ -633,8 +660,8 @@ pub fn feed_mariadb(
 /// phpMyAdmin: GitHub releases announce the versions, the canonical
 /// files.phpmyadmin.net host carries the zips plus a plain `<zip>.sha256` sidecar.
 /// XAMPP ships the all-languages flavour (the locale/ tree is fully populated).
-pub fn feed_phpmyadmin(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, String> {
-    let cur = installed_version(basedir, Comp::Phpmyadmin)?;
+pub fn feed_phpmyadmin(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, String> {
+    let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
     let txt = http::http_get_text(PMA_API)?;
     let val: serde_json::Value =
         serde_json::from_str(&txt).map_err(|e| format!("GitHub releases phpMyAdmin: {e}"))?;
@@ -661,8 +688,10 @@ pub fn feed_phpmyadmin(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, S
         if raw != v.show() && !raw.starts_with(&format!("{}.", v.show())) {
             continue;
         }
-        if !ver_cmp(&v, &cur).is_gt() || (!allow_major && !v.same_line(&cur)) {
-            continue;
+        if let Some(c) = cur {
+            if !ver_cmp(&v, c).is_gt() || (!allow_major && !v.same_line(c)) {
+                continue;
+            }
         }
         if !cands.iter().any(|c| *c == v) {
             cands.push(v);
@@ -682,7 +711,7 @@ pub fn feed_phpmyadmin(basedir: &Path, allow_major: bool) -> Result<Vec<Info>, S
         }
         out.push(Info {
             comp: Comp::Phpmyadmin,
-            installed: cur.show(),
+            installed: shown.clone(),
             available: ver,
             url,
             file,
@@ -743,11 +772,14 @@ pub fn check_all(
     Comp::all()
         .into_iter()
         .map(|c| {
-            let r = match c {
-                Comp::Apache => feed_apache(basedir, allow_major),
-                Comp::Mysql => feed_mariadb(basedir, allow_major, target_line),
-                Comp::Php => feed_php(basedir, allow_major),
-                Comp::Phpmyadmin => feed_phpmyadmin(basedir, allow_major),
+            let r = match installed_opt(basedir, c) {
+                None => Err(format!("{} is not installed", c.label())),
+                Some(cur) => match c {
+                    Comp::Apache => feed_apache(Some(&cur), allow_major),
+                    Comp::Mysql => feed_mariadb(Some(&cur), allow_major, target_line),
+                    Comp::Php => feed_php(Some(&cur), allow_major),
+                    Comp::Phpmyadmin => feed_phpmyadmin(Some(&cur), allow_major),
+                },
             };
             (c, r)
         })
@@ -878,32 +910,35 @@ fn archive_root(dst: &Path, marker: &str) -> PathBuf {
     dst.to_path_buf()
 }
 
-/// Download + verify + swap one component. The modules must already be stopped.
-/// What a successful apply() leaves behind.
-pub struct Applied {
-    pub comp: Comp,
-    pub backup: PathBuf,
-    /// File name of the server binary in the new tree ("mariadbd.exe" after a
-    /// MariaDB major jump), so the caller can update BinaryNames.
-    pub exe: String,
+fn work_dir(basedir: &Path) -> PathBuf {
+    basedir.join("tmp").join("update")
 }
 
-pub fn apply(
+fn ex_dir(basedir: &Path, comp: Comp) -> PathBuf {
+    work_dir(basedir).join(format!("ex-{}", comp.dir()))
+}
+
+/// Drop the extraction shell once the tree that was inside it has been moved
+/// into place.
+pub fn clean_extract(basedir: &Path, comp: Comp) {
+    remove_tree(&ex_dir(basedir, comp));
+}
+
+/// Steps 1..5 shared by a component update and by the first-run installer:
+/// fetch the archive (kept in the cache), verify the published checksum, extract
+/// it and prove the tree really carries the advertised version. Returns the real
+/// tree root (archives differ in nesting) and the marker binary that was found
+/// inside the archive.
+pub fn fetch_verify(
     basedir: &Path,
     info: &Info,
-    keep_backups: usize,
-    data_backup_limit_mb: u64,
     log: &mut dyn FnMut(String, bool),
     prog: &mut dyn FnMut(u64, u64),
-) -> Result<Applied, String> {
+) -> Result<(PathBuf, &'static str), String> {
     let comp = info.comp;
-    let old = basedir.join(comp.dir());
-    if !old.is_dir() {
-        return Err(format!("missing folder: {}", old.display()));
-    }
 
     // 1. archive
-    let work = basedir.join("tmp").join("update");
+    let work = work_dir(basedir);
     fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let archive = work.join(&info.file);
     if archive.exists() {
@@ -968,7 +1003,7 @@ pub fn apply(
     });
     let Some(marker) = marker else {
         return Err(format!(
-            "archive has no {} (nor {}): update refused",
+            "archive has no {} (nor {}): refused",
             comp.exe_candidates()[0],
             comp.exe()
         ));
@@ -984,7 +1019,7 @@ pub fn apply(
     }
 
     // 4. extract
-    let dst = work.join(format!("ex-{}", comp.dir()));
+    let dst = ex_dir(basedir, comp);
     remove_tree(&dst);
     fs::create_dir_all(&dst).map_err(|e| e.to_string())?;
     {
@@ -1000,10 +1035,10 @@ pub fn apply(
 
     // 5. the new binary must really be the advertised version
     if comp == Comp::Phpmyadmin {
-        let marker = format!("RELEASE-DATE-{}", info.available);
-        if !root.join(&marker).is_file() {
+        let rd = format!("RELEASE-DATE-{}", info.available);
+        if !root.join(&rd).is_file() {
             return Err(format!(
-                "the extracted tree has no {marker}: not the announced phpMyAdmin build"
+                "the extracted tree has no {rd}: not the announced phpMyAdmin build"
             ));
         }
     } else {
@@ -1019,6 +1054,35 @@ pub fn apply(
             None => return Err("unreadable PE version in the extracted binary".into()),
         }
     }
+    Ok((root, marker))
+}
+
+/// Download + verify + swap one component. The modules must already be stopped.
+/// What a successful apply() leaves behind.
+pub struct Applied {
+    pub comp: Comp,
+    pub backup: PathBuf,
+    /// File name of the server binary in the new tree ("mariadbd.exe" after a
+    /// MariaDB major jump), so the caller can update BinaryNames.
+    pub exe: String,
+}
+
+pub fn apply(
+    basedir: &Path,
+    info: &Info,
+    keep_backups: usize,
+    data_backup_limit_mb: u64,
+    log: &mut dyn FnMut(String, bool),
+    prog: &mut dyn FnMut(u64, u64),
+) -> Result<Applied, String> {
+    let comp = info.comp;
+    let old = basedir.join(comp.dir());
+    if !old.is_dir() {
+        return Err(format!("missing folder: {}", old.display()));
+    }
+
+    let (root, marker) = fetch_verify(basedir, info, log, prog)?;
+    let dst = ex_dir(basedir, comp);
     if comp == Comp::Mysql {
         let jump = match (Ver::parse(&info.installed), Ver::parse(&info.available)) {
             (Some(from), Some(to)) => !from.same_line(&to),
@@ -1035,7 +1099,6 @@ pub fn apply(
             );
         }
     }
-
     let backup = basedir.join(".backup").join(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1123,6 +1186,7 @@ pub fn apply(
     }
 
     remove_tree(&dst);
+    let archive = work_dir(basedir).join(&info.file);
     if archive.is_file() {
         let _ = fs::remove_file(&archive);
     }

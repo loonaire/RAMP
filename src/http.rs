@@ -44,14 +44,10 @@ impl Drop for Conn {
     }
 }
 
-fn split(url: &str) -> Result<(u16, String, String), String> {
+fn split(url: &str) -> Result<(u16, String, String, bool), String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("bad URL: {url}"))?;
-    match scheme {
-        "https" => {}
-        s => return Err(format!("HTTPS required, refused: {s}")),
-    }
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
@@ -61,13 +57,21 @@ fn split(url: &str) -> Result<(u16, String, String), String> {
             h.to_string(),
             p.parse::<u16>().map_err(|_| format!("bad port: {p}"))?,
         ),
-        None => (hostport.to_string(), 443u16),
+        None => (hostport.to_string(), if scheme == "https" { 443 } else { 80 }),
     };
-    Ok((port, host, path))
+    // Plain HTTP is only ever accepted against the loopback interface: the panel
+    // probes the web server it installed itself. Anything else stays on TLS.
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let secure = match scheme {
+        "https" => true,
+        "http" if loopback => false,
+        s => return Err(format!("HTTPS required, refused: {s}")),
+    };
+    Ok((port, host, path, secure))
 }
 
 fn open_request(url: &str) -> Result<Conn, String> {
-    let (port, host, path) = split(url)?;
+    let (port, host, path, secure) = split(url)?;
     let agent = widez(UA);
     let session = unsafe {
         WinHttpOpen(
@@ -110,7 +114,11 @@ fn open_request(url: &str) -> Result<Conn, String> {
             PCWSTR::null(),
             PCWSTR::null(),
             std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
+            if secure {
+                WINHTTP_FLAG_SECURE
+            } else {
+                windows::Win32::Networking::WinHttp::WINHTTP_OPEN_REQUEST_FLAGS(0)
+            },
         );
         if req.is_null() {
             return Err(format!("WinHttpOpenRequest({host}{path}) failed"));

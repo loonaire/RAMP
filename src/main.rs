@@ -1,5 +1,6 @@
 mod config;
 mod http;
+mod install;
 mod netstat;
 mod procs;
 mod update;
@@ -759,6 +760,8 @@ enum UpdMsg {
     Log(String, bool),
     Finished(Result<update::Applied, String>),
     Restored(update::Comp, Result<String, String>),
+    /// First-run bootstrap: the server binaries the install ended up with.
+    BootDone(Result<(String, String), String>),
 }
 
 /// MariaDB >= 10.5 refuses "InnoDB: upgrade after a crash". The panel stops
@@ -1262,6 +1265,80 @@ fn upd_check(app: &AppRc, _ui: &Ui) {
     });
 }
 
+/// First run of a fresh package: install everything in the background. Only a
+/// completely empty tree triggers this; a package that is missing a single
+/// component gets a hint instead, because removing one on purpose is a normal
+/// thing to do. The worker talks through the updater's queue, so the log panel
+/// follows along and the panel stays usable.
+fn start_first_run(app: &AppRc, _ui: &Ui) {
+    let (bd, o) = {
+        let mut a = app.borrow_mut();
+        if a.upd_busy {
+            return;
+        }
+        let miss = install::missing(&a.basedir);
+        let repair = miss.is_empty() && install::needs_repair(&a.basedir);
+        if miss.is_empty() && !repair {
+            return;
+        }
+        if repair {
+            add_log(
+                &mut a,
+                _ui,
+                "update",
+                "this installation lives somewhere else than its configuration says: re-anchoring it",
+                LogType::Info,
+            );
+        }
+        if miss.len() < 4 {
+            add_log(
+                &mut a,
+                _ui,
+                "update",
+                &format!(
+                    "missing component(s): {}. Reinstall them from the update window, or run ramp --first-run.",
+                    miss.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
+                ),
+                LogType::Error,
+            );
+            return;
+        }
+        let o = install::Opts {
+            apache_port: a.cfg.apache_port,
+            mysql_port: a.cfg.mysql_port,
+            target_line: a.cfg.upd_target_line.clone(),
+            verify: !repair,
+        };
+        (a.basedir.clone(), o)
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let mut a = app.borrow_mut();
+        a.upd_busy = true;
+        a.upd_rx = Some(rx);
+    }
+    if let Some(w) = app.borrow().upd_win.clone() {
+        w.set_busy(true);
+        w.set_status("Installing the components...".into());
+    }
+    add_log(
+        &mut app.borrow_mut(),
+        _ui,
+        "update",
+        "First run: downloading and installing MariaDB, PHP, Apache and phpMyAdmin. This takes a few minutes...",
+        LogType::Info,
+    );
+    std::thread::spawn(move || {
+        let mut lg = |line: String, warn: bool| {
+            let _ = tx.send(UpdMsg::Log(line, warn));
+        };
+        let mut pg = |_done: u64, _total: u64| {};
+        let r = install::bootstrap(&bd, &o, &mut lg, &mut pg)
+            .map(|b| (b.apache_exe, b.mysql_exe));
+        let _ = tx.send(UpdMsg::BootDone(r));
+    });
+}
+
 /// Apply one row of the update window on a worker thread.
 fn upd_apply(app: &AppRc, _ui: &Ui, row: usize) {
     let (info, ports, name, binary, keep, limit, basedir) = {
@@ -1572,6 +1649,33 @@ fn upd_drain(app: &mut App, ui: &Ui) {
                         ui,
                         "update",
                         &format!("Restore failed: {e}"),
+                        LogType::Error,
+                    ),
+                }
+                if let Some(w) = app.upd_win.clone() {
+                    w.set_status("Done.".into());
+                }
+            }
+            UpdMsg::BootDone(r) => {
+                pending = false;
+                app.upd_busy = false;
+                match r {
+                    Ok((apache_exe, mysql_exe)) => {
+                        add_log(
+                            app,
+                            ui,
+                            "update",
+                            "Installation complete. Apache and MariaDB can now be started from the panel.",
+                            LogType::Info,
+                        );
+                        sync_binary_name(app, update::Comp::Apache, &apache_exe, ui);
+                        sync_binary_name(app, update::Comp::Mysql, &mysql_exe, ui);
+                    }
+                    Err(e) => add_log(
+                        app,
+                        ui,
+                        "update",
+                        &format!("Installation failed: {e}"),
                         LogType::Error,
                     ),
                 }
@@ -2756,6 +2860,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let args: Vec<String> = std::env::args().collect();
+
+    // A completely empty package installs itself once the window is up, unless
+    // a CLI mode is driving.
+    if args.len() <= 1 {
+        let app_fr = app.clone();
+        let ui_fr = ui.clone();
+        Timer::single_shot(std::time::Duration::from_millis(800), move || {
+            start_first_run(&app_fr, &ui_fr);
+        });
+    }
+
+    // Headless first-run install: ramp --first-run [--no-verify]
+    if args.iter().any(|a| a == "--first-run") {
+        let verify = !args.iter().any(|a| a == "--no-verify");
+        let app_t = app.clone();
+        let ui_t = ui.clone();
+        Timer::single_shot(std::time::Duration::from_millis(900), move || {
+            let (bd, o) = {
+                let a = app_t.borrow();
+                (
+                    a.basedir.clone(),
+                    install::Opts {
+                        apache_port: a.cfg.apache_port,
+                        mysql_port: a.cfg.mysql_port,
+                        target_line: a.cfg.upd_target_line.clone(),
+                        verify,
+                    },
+                )
+            };
+            let mut last = 0u64;
+            let mut lg = |l: String, warn: bool| {
+                add_log(
+                    &mut app_t.borrow_mut(),
+                    &ui_t,
+                    "update",
+                    &l,
+                    if warn { LogType::Error } else { LogType::Info },
+                );
+            };
+            let mut pg = |done: u64, total: u64| {
+                if total == 0 {
+                    return;
+                }
+                let pct = done * 100 / total;
+                if pct / 20 != last / 20 {
+                    last = pct;
+                    add_log(
+                        &mut app_t.borrow_mut(),
+                        &ui_t,
+                        "update",
+                        &format!("download {pct}%"),
+                        LogType::Default,
+                    );
+                }
+            };
+            let r = install::bootstrap(&bd, &o, &mut lg, &mut pg);
+            let mut a = app_t.borrow_mut();
+            match r {
+                Ok(b) => {
+                    add_log(
+                        &mut a,
+                        &ui_t,
+                        "update",
+                        &format!("CLI: installed, binaries {} / {}", b.apache_exe, b.mysql_exe),
+                        LogType::Info,
+                    );
+                    sync_binary_name(&mut a, update::Comp::Apache, &b.apache_exe, &ui_t);
+                    sync_binary_name(&mut a, update::Comp::Mysql, &b.mysql_exe, &ui_t);
+                }
+                Err(e) => add_log(
+                    &mut a,
+                    &ui_t,
+                    "update",
+                    &format!("CLI: install failed: {e}"),
+                    LogType::Error,
+                ),
+            }
+            do_quit(&mut a, &ui_t);
+        });
+    }
 
     // Headless feed check: ramp --update-check [--json]
     // GUI-subsystem binary: nothing is attached to stdout, so the result goes to

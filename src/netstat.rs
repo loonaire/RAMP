@@ -9,6 +9,8 @@ use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 pub struct TcpEntry {
     pub local: u16,
     pub pid: u32,
+    /// MIB_TCP_STATE_* value: 2 is LISTEN, everything else is connection debris.
+    pub state: u32,
 }
 
 fn swap_port(p: u32) -> u16 {
@@ -63,6 +65,7 @@ fn tcp_table_family(af: u32) -> Vec<TcpEntry> {
                 .map(|row| TcpEntry {
                     local: swap_port(row.dwLocalPort),
                     pid: row.dwOwningPid,
+                    state: row.dwState,
                 })
                 .collect()
         } else {
@@ -80,6 +83,7 @@ fn tcp_table_family(af: u32) -> Vec<TcpEntry> {
                 .map(|row| TcpEntry {
                     local: swap_port(row.dwLocalPort),
                     pid: row.dwOwningPid,
+                    state: row.dwState,
                 })
                 .collect()
         }
