@@ -877,7 +877,7 @@ fn remove_tree(p: &Path) {
 }
 
 fn mib(n: u64) -> String {
-    format!("{:.1} Mo", n as f64 / 1_048_576.0)
+    format!("{:.1} MiB", n as f64 / 1_048_576.0)
 }
 
 /// Extract `root` of a normalised tree out of the archive.
@@ -922,6 +922,47 @@ fn ex_dir(basedir: &Path, comp: Comp) -> PathBuf {
 /// into place.
 pub fn clean_extract(basedir: &Path, comp: Comp) {
     remove_tree(&ex_dir(basedir, comp));
+}
+
+/// The archive has done its job and nothing needs it any more: delete it, then
+/// the scratch folder itself once it holds nothing. A failed install keeps its
+/// archive on purpose, so a retry does not pay for the download twice.
+/// Never touch `<basedir>/tmp` itself: php.ini points upload_tmp_dir and
+/// session.save_path at it.
+pub fn drop_archive(basedir: &Path, file: &str, log: &mut dyn FnMut(String, bool)) {
+    let work = work_dir(basedir);
+    let archive = work.join(file);
+    if archive.is_file() {
+        let sz = fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+        if fs::remove_file(&archive).is_ok() {
+            log(format!("downloaded archive deleted: {file} ({})", mib(sz)), false);
+        }
+    }
+    let empty = fs::read_dir(&work).map(|mut d| d.next().is_none()).unwrap_or(false);
+    if empty {
+        remove_tree(&work);
+    }
+}
+
+/// Sweep what an interrupted run left in the scratch folder. Called when a job
+/// is finished, so the package never ships 100+ MB of archives.
+pub fn sweep_work_dir(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let work = work_dir(basedir);
+    if !work.is_dir() {
+        return;
+    }
+    let sz = tree_size(&work);
+    remove_tree(&work);
+    if sz > 0 {
+        log(
+            format!(
+                "download cache removed: {} ({})",
+                work.display(),
+                mib(sz)
+            ),
+            false,
+        );
+    }
 }
 
 /// Steps 1..5 shared by a component update and by the first-run installer:
@@ -1186,10 +1227,7 @@ pub fn apply(
     }
 
     remove_tree(&dst);
-    let archive = work_dir(basedir).join(&info.file);
-    if archive.is_file() {
-        let _ = fs::remove_file(&archive);
-    }
+    drop_archive(basedir, &info.file, log);
     gc_backups(basedir, keep_backups, log);
     if comp == Comp::Apache || comp == Comp::Php {
         patch_compat(basedir, log);

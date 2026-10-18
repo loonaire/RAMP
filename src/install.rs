@@ -245,6 +245,7 @@ fn install_one(
     fs::rename(&root, &dst)
         .map_err(|e| format!("move {} -> {}: {e}", root.display(), dst.display()))?;
     update::clean_extract(basedir, comp);
+    update::drop_archive(basedir, &info.file, log);
     let exe = marker.rsplit('/').next().unwrap_or(marker).to_string();
     log(
         format!(
@@ -987,6 +988,7 @@ pub fn bootstrap(
             )?;
         }
     }
+    update::sweep_work_dir(basedir, log);
     log("installation complete".into(), false);
     Ok(boot)
 }
