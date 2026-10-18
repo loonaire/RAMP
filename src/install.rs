@@ -327,6 +327,15 @@ fn drive_paths(txt: &str) -> Vec<String> {
 /// The tree an Apache build was made on: `C:/Apache24-64` for an Apache Lounge
 /// archive, found by walking the directories those paths live in (strays such
 /// as `D:/server.crt` cannot join the majority and are dropped).
+/// A stock Windows location that is never an earlier copy of this installation:
+/// Apache's own examples point at C:/Users/*/My Documents and the like, and
+/// rewriting one of those breaks the module instead of moving it.
+fn foreign_system_path(lower: &str) -> bool {
+    ["/users/", "/programdata", "/program files", "/windows/", "/appdata"]
+        .iter()
+        .any(|p| lower.contains(p))
+}
+
 fn stock_root(txt: &str) -> Option<String> {
     let parents: Vec<String> = drive_paths(txt)
         .iter()
@@ -384,9 +393,47 @@ const VHOSTS_NOTE: &str = "# RAMP\n# The virtual hosts that ship with an Apache 
 /// Re-anchor the conf/extra files the Apache archive brought along: they name
 /// the build machine, which no portable tree can honour. Only untouched stock
 /// files are touched, never the RAMP files this installer writes.
+/// Put back a directory that an earlier build duplicated: replacing the package
+/// root by the ServerRoot turned <basedir>/apache/logs into
+/// <basedir>/apache/apache/logs, and httpd -t then refused the vhost log path.
+fn collapse_doubled(txt: &mut String, base: &str, comp: &str) -> bool {
+    let fixed = format!("{base}/{comp}/");
+    let pat = format!("{base}/{comp}/{comp}/");
+    if txt.contains(&pat) {
+        *txt = txt.replace(&pat, &fixed);
+        return true;
+    }
+    // Tolerate another spelling of the drive letter: the byte length of an
+    // ASCII path is the same lowercased, so offsets stay valid.
+    let hay = txt.to_lowercase();
+    let pl = pat.to_lowercase();
+    let mut from = 0usize;
+    let mut out = String::new();
+    let mut hit = false;
+    while let Some(i) = hay[from..].find(&pl) {
+        let at = from + i;
+        out.push_str(&txt[..at]);
+        out.push_str(&fixed);
+        from = at + pl.len();
+        hit = true;
+    }
+    if hit {
+        out.push_str(&txt[from..]);
+        *txt = out;
+    }
+    hit
+}
+
 fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     let extra = basedir.join("apache\\conf\\extra");
     let srvroot = fwd(&basedir.join("apache"));
+    let base = fwd(basedir);
+    // A re-anchored path must land on something this package really holds, so
+    // only these directories count as a sign that a root is an installation
+    // root and not a Windows user home or a stock example path.
+    const COMPONENTS: [&str; 9] = [
+        "apache", "php", "mysql", "phpmyadmin", "htdocs", "cgi-bin", "logs", "conf", "tmp",
+    ];
     let Ok(rd) = fs::read_dir(&extra) else { return };
     let mut names: Vec<String> = Vec::new();
     for e in rd.flatten() {
@@ -401,6 +448,19 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     for name in names {
         let p = extra.join(&name);
         let Ok(txt) = fs::read_to_string(&p) else { continue };
+        let mut txt = txt;
+        let mut collapsed = 0usize;
+        for c in ["apache", "php", "mysql", "phpMyAdmin"] {
+            if collapse_doubled(&mut txt, &base, c) {
+                collapsed += 1;
+            }
+        }
+        if collapsed > 0 && write_text(&p, &txt).is_ok() {
+            log(
+                format!("conf/extra/{name}: {collapsed} duplicated folder name(s) put back"),
+                false,
+            );
+        }
         if txt.lines().any(|l| !l.trim_start().starts_with('#') && l.contains("dummy-host")) {
             if write_text(&p, VHOSTS_NOTE).is_ok() {
                 log(format!("conf/extra/{name}: the build machine's dummy virtual hosts removed"), false);
@@ -408,15 +468,54 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
             continue;
         }
         let Some(root) = stock_root(&txt) else { continue };
-        if root.eq_ignore_ascii_case(&srvroot) {
+        // Already ours: rewriting it again is what duplicated a directory
+        // (the package root replaced by the ServerRoot made httpd-ssl.conf
+        // ask for <basedir>/apache/apache/logs, which httpd -t rejects).
+        if root.eq_ignore_ascii_case(&srvroot) || root.eq_ignore_ascii_case(&base) {
             continue;
         }
-        let out = txt.replace(&root, &srvroot);
+        if root.contains('*') || foreign_system_path(&root.to_lowercase()) {
+            // Stock examples such as C:/Users/*/My Documents are not this
+            // installation's business; Apache accepts them as they are.
+            continue;
+        }
+        let direct: Vec<String> = drive_paths(&txt)
+            .iter()
+            .filter(|p| p.len() > root.len() && p[..root.len()].eq_ignore_ascii_case(&root))
+            .filter_map(|p| {
+                let tail = &p[root.len()..];
+                tail.strip_prefix('/').unwrap_or(tail)
+                    .split('/')
+                    .next()
+                    .map(|s| s.to_lowercase())
+            })
+            .collect();
+        if !direct.iter().any(|s| COMPONENTS.contains(&s.as_str())) {
+            continue;
+        }
+        // <oldroot>/apache/... means <oldroot> was the package folder itself;
+        // <oldroot>/logs|conf/... means it already was the ServerRoot.
+        let new_base = if direct.iter().any(|s| s == "apache") {
+            base.clone()
+        } else {
+            srvroot.clone()
+        };
+        let out = txt.replace(&root, &new_base);
         if out == txt {
             continue;
         }
         if write_text(&p, &out).is_ok() {
-            log(format!("conf/extra/{name}: {root} re-anchored onto this installation"), false);
+            log(
+                format!(
+                    "conf/extra/{name}: {root} re-anchored onto {}",
+                    if new_base == base {
+                        "this installation"
+                    } else {
+                        "this installation's ServerRoot"
+                    }
+                ),
+                false,
+            );
         }
     }
 
