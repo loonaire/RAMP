@@ -880,6 +880,18 @@ fn mib(n: u64) -> String {
     format!("{:.1} MiB", n as f64 / 1_048_576.0)
 }
 
+/// Size for things that are not megabyte-scale (the scratch folder is mostly
+/// loose session and temp files).
+fn hb(n: u64) -> String {
+    if n >= 1_048_576 {
+        mib(n)
+    } else if n >= 1024 {
+        format!("{:.0} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
 /// Extract `root` of a normalised tree out of the archive.
 /// Locate the real tree inside the extraction dir: archives differ in nesting
 /// (PHP and MariaDB use one root folder, Apache Lounge uses "Apache24/").
@@ -944,24 +956,40 @@ pub fn drop_archive(basedir: &Path, file: &str, log: &mut dyn FnMut(String, bool
     }
 }
 
-/// Sweep what an interrupted run left in the scratch folder. Called when a job
-/// is finished, so the package never ships 100+ MB of archives.
-pub fn sweep_work_dir(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
-    let work = work_dir(basedir);
-    if !work.is_dir() {
+/// Sweep the scratch folder when a job is finished: the package must not carry
+/// 100+ MB of archives, and `<basedir>/tmp` itself only exists to serve the
+/// servers while they run. ensure_runtime_dirs() puts it back before the next
+/// start, so an idle package stays clean. A server that is still running keeps
+/// its files open in there, and then the folder is left alone.
+pub fn sweep_tmp(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let tmp = basedir.join("tmp");
+    if !tmp.is_dir() {
         return;
     }
-    let sz = tree_size(&work);
-    remove_tree(&work);
-    if sz > 0 {
+    let freed = tree_size(&tmp);
+    remove_tree(&tmp);
+    if tmp.exists() {
         log(
-            format!(
-                "download cache removed: {} ({})",
-                work.display(),
-                mib(sz)
-            ),
-            false,
+            "could not remove tmp/: a server still has files open in it".into(),
+            true,
         );
+    } else {
+        log(format!("tmp/ removed ({})", hb(freed)), false);
+    }
+}
+
+/// Folders the ini files point at (php.ini session.save_path and upload_tmp_dir,
+/// my.ini tmpdir, PHP's log file). A missing save_path silently kills sessions
+/// (phpMyAdmin login) and MariaDB cannot sort without its tmpdir, so this runs
+/// on every launch and again before any module starts.
+pub fn ensure_runtime_dirs(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    for d in ["tmp", "php\\logs"] {
+        let p = basedir.join(d);
+        if !p.is_dir() {
+            if let Err(e) = fs::create_dir_all(&p) {
+                log(format!("cannot create {}: {e}", p.display()), true);
+            }
+        }
     }
 }
 
@@ -1452,16 +1480,8 @@ fn patch_php_ini_paths(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         }
     }
     // The re-rooted ini points sessions/uploads at these dirs; PHP creates the
-    // log file but not its folder, and a missing save_path silently kills
-    // sessions (phpMyAdmin login).
-    for d in ["tmp", "php\\logs"] {
-        let p = basedir.join(d);
-        if !p.is_dir() {
-            if let Err(e) = fs::create_dir_all(&p) {
-                log(format!("compat: cannot create {}: {e}", p.display()), true);
-            }
-        }
-    }
+    // log file but not its folder.
+    ensure_runtime_dirs(basedir, log);
 }
 
 /// mod_php also scans httpd.exe's own directory for a php.ini when the process

@@ -698,6 +698,9 @@ fn anchor_by_title(title: String, retries: u8) {
 /// that to the 250 ms timer. A swap is only trustworthy once the new build has
 /// been shown to boot.
 fn start_module_blocking(basedir: &Path, name: &str, binary: &str) -> Result<(), String> {
+    // A finished install deletes the scratch folder tmp/, and my.ini/php.ini
+    // point their tmpdir, session.save_path and upload_tmp_dir right at it.
+    update::ensure_runtime_dirs(basedir, &mut |_, _| {});
     let cmdline = if name == "Apache" {
         format!(
             "\"{}\"",
@@ -2111,6 +2114,18 @@ fn check_ports(app: &mut App, ui: &Ui, idx: usize) {
 
 fn start_module(app: &mut App, ui: &Ui, idx: usize) {
     app.modules[idx].phase = Phase::Starting;
+    // The scratch folder tmp/ is deleted when an install finishes; the server
+    // about to start needs it (my.ini tmpdir, php.ini session/upload dirs).
+    let bd = app.basedir.clone();
+    update::ensure_runtime_dirs(&bd, &mut |l, warn| {
+        add_log(
+            app,
+            ui,
+            "main",
+            &l,
+            if warn { LogType::Error } else { LogType::Debug },
+        )
+    });
     app.tcp = netstat::tcp_table();
     check_ports(app, ui, idx);
     let name = app.modules[idx].name;

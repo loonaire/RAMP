@@ -988,7 +988,7 @@ pub fn bootstrap(
             )?;
         }
     }
-    update::sweep_work_dir(basedir, log);
+    update::sweep_tmp(basedir, log);
     log("installation complete".into(), false);
     Ok(boot)
 }
