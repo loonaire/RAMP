@@ -12,6 +12,7 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", 
 zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 slint-build = "1.18"
 
 [profile.release]

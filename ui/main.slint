@@ -23,6 +23,7 @@ export component MainWindow inherits Window {
     title: "RAMP Control Panel";
     width: 690px;
     height: 480px;
+    icon: @image-url("../assets/logo.png");
 
     in property <[ModuleInfo]> modules;
     in property <[LogLine]> logs;
@@ -188,6 +189,7 @@ export component ConfigWindow inherits Window {
     title: "Settings";
     width: 480px;
     height: 440px;
+    icon: @image-url("../assets/logo.png");
 
     in-out property <string> apache-port;
     in-out property <string> apache-ssl-port;
@@ -263,6 +265,7 @@ export component UpdateWindow inherits Window {
     title: "Component Updates";
     width: 680px;
     height: 430px;
+    icon: @image-url("../assets/logo.png");
 
     in property <[UpdateInfo]> rows;
     in property <bool> busy;
@@ -402,6 +405,7 @@ export component FileWindow inherits Window {
     title: "RAMP Files";
     width: 520px;
     height: 380px;
+    icon: @image-url("../assets/logo.png");
 
     in property <string> heading;
     in property <[FileRow]> rows;
@@ -455,6 +459,7 @@ export component DepWindow inherits Window {
     title: "Missing libraries";
     width: 480px;
     height: 220px;
+    icon: @image-url("../assets/logo.png");
 
     in property <string> headline;
     in property <string> details;
@@ -487,6 +492,7 @@ export component AboutWindow inherits Window {
     title: "About RAMP Control Panel";
     width: 340px;
     height: 230px;
+    icon: @image-url("../assets/logo.png");
 
     in property <string> app-version;
 
