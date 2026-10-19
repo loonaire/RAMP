@@ -1,6 +1,6 @@
 [package]
 name = "ramp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "RAMP Control Panel: modern Rust + Slint rewrite of the XAMPP Control Panel (Apache + MySQL only, no Windows services)"
 
