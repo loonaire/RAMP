@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ListView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView } from "std-widgets.slint";
 
 export struct ModuleInfo {
     name: string,
@@ -163,12 +163,20 @@ export component MainWindow inherits Window {
                     padding-bottom: 4px;
                     Text { text: "LOG"; color: #8a8f98; font-size: 10px; }
                 }
-                log-list := ListView {
-                    for log in logs: Rectangle {
-                        height: 18px;
-                        log-layout := HorizontalLayout {
-                            x: 10px; y: 1px;
-                            width: parent.width - 26px;
+                // Lines are never cut: the layout is as wide as the longest one,
+                // and the view scrolls sideways (scrollbar, or Shift + wheel).
+                // A plain ScrollView rather than a ListView: the log holds at
+                // most MAX_LOG_LINES rows, and its layout gives the content width.
+                log-list := ScrollView {
+                    VerticalLayout {
+                        alignment: start;
+                        padding-left: 10px;
+                        // Room for the scrollbars, which overlay the content.
+                        padding-right: 16px;
+                        padding-bottom: 14px;
+                        for log in logs: HorizontalLayout {
+                            height: 18px;
+                            padding-top: 1px;
                             spacing: 8px;
                             Text { text: log.time; color: #6f747d; font-size: 11px; font-family: "Consolas"; }
                             Text { text: "[" + log.module + "]"; color: #6aa3ff; font-size: 11px; font-family: "Consolas"; }
@@ -188,7 +196,7 @@ export component MainWindow inherits Window {
 export component ConfigWindow inherits Window {
     title: "Settings";
     width: 480px;
-    height: 440px;
+    height: 464px;
     icon: @image-url("../assets/logo.png");
 
     in-out property <string> apache-port;
@@ -221,6 +229,11 @@ export component ConfigWindow inherits Window {
             spacing: 8px;
             Text { text: "MySQL:"; width: 150px; vertical-alignment: center; }
             LineEdit { text <=> root.mysql-port; }
+        }
+        Text {
+            text: "Written into the servers' own config files; restart a running server to apply.";
+            color: #8a8f98;
+            font-size: 11px;
         }
 
         Text { text: "Checks"; color: #8a8f98; font-size: 11px; }

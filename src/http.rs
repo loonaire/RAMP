@@ -70,7 +70,8 @@ fn split(url: &str) -> Result<(u16, String, String, bool), String> {
     Ok((port, host, path, secure))
 }
 
-fn open_request(url: &str) -> Result<Conn, String> {
+/// `redirects` is a WINHTTP_OPTION_REDIRECT_POLICY_* value.
+fn open_request(url: &str, redirects: u32) -> Result<Conn, String> {
     let (port, host, path, secure) = split(url)?;
     let agent = widez(UA);
     let session = unsafe {
@@ -92,7 +93,7 @@ fn open_request(url: &str) -> Result<Conn, String> {
     };
     unsafe {
         let _ = WinHttpSetTimeouts(guard.session, 15_000, 25_000, 60_000, 120_000);
-        let policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS.to_le_bytes();
+        let policy = redirects.to_le_bytes();
         WinHttpSetOption(
             Some(guard.session),
             WINHTTP_OPTION_REDIRECT_POLICY,
@@ -168,9 +169,11 @@ fn content_length(req: *mut c_void) -> u64 {
     }
 }
 
-/// Body of one GET. Redirects are followed by WinHTTP itself.
+/// Body of one GET. Redirects are followed by WinHTTP itself, never from HTTPS
+/// down to plain HTTP: feeds and checksums are what downloads are verified
+/// against, so they must stay on TLS end to end.
 pub fn http_get(url: &str) -> Result<Resp, String> {
-    let conn = open_request(url)?;
+    let conn = open_request(url, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP)?;
     unsafe {
         WinHttpSendRequest(conn.req, None, None, 0, 0, 0)
             .map_err(|e| format!("send to {}: {e}", redact(url)))?;
@@ -207,12 +210,15 @@ pub fn http_get_text(url: &str) -> Result<String, String> {
 }
 
 /// Streamed download to `dest`; `progress(done, total)` where total = 0 is unknown.
+/// Any redirect is followed here, plain-HTTP mirrors included (MariaDB hands out
+/// mirrors): the caller only accepts an archive whose SHA256, fetched over TLS,
+/// matches.
 pub fn http_download(
     url: &str,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64, String> {
-    let conn = open_request(url)?;
+    let conn = open_request(url, WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS)?;
     unsafe {
         WinHttpSendRequest(conn.req, None, None, 0, 0, 0)
             .map_err(|e| format!("send to {}: {e}", redact(url)))?;

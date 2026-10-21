@@ -307,7 +307,7 @@ pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, Strin
             .map(human_size)
             .unwrap_or(0);
         out.push((
-            v.clone(),
+            v,
             Info {
                 comp: Comp::Php,
                 installed: shown.clone(),
@@ -613,7 +613,7 @@ pub fn feed_mariadb(
                     .map(|(bv, _, _, _, _)| ver_cmp(&rv, bv).is_gt())
                     .unwrap_or(true)
                 {
-                    best = Some((rv.clone(), name.to_string(), url, sha, size));
+                    best = Some((rv, name.to_string(), url, sha, size));
                 }
             }
         }
@@ -629,7 +629,7 @@ pub fn feed_mariadb(
                 );
             }
             out.push((
-                rv.clone(),
+                rv,
                 Info {
                     comp: Comp::Mysql,
                     installed: shown.clone(),
@@ -693,7 +693,7 @@ pub fn feed_phpmyadmin(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>
                 continue;
             }
         }
-        if !cands.iter().any(|c| *c == v) {
+        if !cands.contains(&v) {
             cands.push(v);
         }
     }
@@ -727,7 +727,7 @@ pub fn feed_phpmyadmin(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>
 
 /// Sidecar shaped like `<64 hex>  <filename>` (files.phpmyadmin.net style).
 fn parse_plain_sha256(txt: &str) -> Option<String> {
-    let tok = txt.trim().split_whitespace().next()?;
+    let tok = txt.split_whitespace().next()?;
     if tok.len() == 64 && tok.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(tok.to_lowercase())
     } else {
@@ -792,7 +792,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let data = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut h = Sha256::new();
     h.update(&data);
-    Ok(hex::encode(&h.finalize()))
+    Ok(hex::encode(h.finalize()))
 }
 
 mod hex {
@@ -1006,12 +1006,22 @@ pub fn fetch_verify(
 ) -> Result<(PathBuf, &'static str), String> {
     let comp = info.comp;
 
+    // Every feed publishes a SHA256 (releases.json, the MariaDB REST API, the
+    // Apache Lounge and phpMyAdmin sidecars). None means its fetch failed, and
+    // the archive may arrive from a plain-HTTP mirror: nothing would vouch for it.
+    if info.sha256.is_empty() {
+        return Err(format!(
+            "no SHA256 could be fetched for {}: an unverified archive is never installed, retry later",
+            info.file
+        ));
+    }
+
     // 1. archive
     let work = work_dir(basedir);
     fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let archive = work.join(&info.file);
     if archive.exists() {
-        if !info.sha256.is_empty() && sha256_file(&archive)? == info.sha256 {
+        if sha256_file(&archive)? == info.sha256 {
             log(format!("archive already cached: {}", info.file), false);
         } else {
             remove_tree(&archive);
@@ -1039,12 +1049,7 @@ pub fn fetch_verify(
 
     // 2. checksum
     let got = sha256_file(&archive)?;
-    if info.sha256.is_empty() {
-        log(
-            format!("SHA256 (not published by the source): {got}"),
-            false,
-        );
-    } else if got != info.sha256 {
+    if got != info.sha256 {
         return Err(format!(
             "bad SHA256\n expected {}\n obtained {}\n the archive was not installed",
             info.sha256, got
@@ -1286,6 +1291,7 @@ pub fn apply(
 ///    only covers request scope, not module init.
 ///  - php.ini: session.sid_length / session.sid_bits_per_character are deprecated
 ///    since PHP 8.5 and pollute the error log at every start; commented out.
+///
 /// Idempotent: only rewrites files when something actually changes.
 pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     // Path portability applies regardless of the PHP version: the tree is
@@ -1294,6 +1300,8 @@ pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     // extension_dir baked in at build time.
     patch_php_ini_paths(basedir, log);
     ensure_ini_fallback(basedir, log);
+    disable_php_cgi_alias(basedir, log);
+    crate::install::fix_ssl_conf(basedir, log);
     let php_exe = basedir.join("php").join("php.exe");
     let php_new = pe_version(&php_exe)
         .map(|v| ver_cmp(&v, &Ver([8, 5, 0, 0])) != std::cmp::Ordering::Less)
@@ -1307,10 +1315,7 @@ pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
 }
 
 fn read_text(p: &Path) -> Option<String> {
-    match fs::read_to_string(p) {
-        Ok(s) => Some(s),
-        Err(_) => None,
-    }
+    fs::read_to_string(p).ok()
 }
 
 fn patch_xampp_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
@@ -1360,6 +1365,51 @@ fn patch_xampp_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     } else {
         log(
             format!("compat: PHPINIDir disabled in httpd-xampp.conf ({commented} line(s))"),
+            false,
+        );
+    }
+}
+
+/// XAMPP's httpd-xampp.conf maps /php-cgi/ onto the php folder and opens
+/// php-cgi.exe to every client, although PHP runs as mod_php (the CGI handler is
+/// commented out). That alias is the CVE-2024-4577 entry point (argument
+/// injection into php-cgi.exe) and Apache listens on every interface, so it is
+/// commented out, unless a live `Action ... php-cgi` line still relies on it.
+fn disable_php_cgi_alias(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let f = basedir
+        .join("apache")
+        .join("conf")
+        .join("extra")
+        .join("httpd-xampp.conf");
+    let Some(text) = read_text(&f) else {
+        return;
+    };
+    let cgi_in_use = text.lines().any(|l| {
+        let t = l.trim_start().to_ascii_lowercase();
+        t.starts_with("action") && t.contains("php-cgi")
+    });
+    if cgi_in_use {
+        return;
+    }
+    let mut n = 0usize;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let t = line.trim_start().to_ascii_lowercase();
+        if t.starts_with("scriptalias") && t.contains("/php-cgi/") {
+            out.push('#');
+            n += 1;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if n == 0 {
+        return;
+    }
+    if let Err(e) = fs::write(&f, out) {
+        log(format!("compat: cannot write {}: {e}", f.display()), true);
+    } else {
+        log(
+            "compat: /php-cgi/ alias disabled in httpd-xampp.conf (PHP runs as mod_php; the alias exposed php-cgi.exe, CVE-2024-4577)".into(),
             false,
         );
     }
@@ -1434,13 +1484,14 @@ fn patch_php_ini_paths(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     for line in text.lines() {
         let t = line.trim_start();
         let key = t.split('=').next().unwrap_or("").trim_end();
-        let hit = if t.starts_with(';') || key.is_empty() {
+        let eq = line.find('=');
+        let hit = if t.starts_with(';') || key.is_empty() || eq.is_none() {
             None
         } else {
             want.iter().find(|(k, _, _)| k.eq_ignore_ascii_case(key))
         };
-        match hit {
-            Some((_, val, must_exist)) => {
+        match (hit, eq) {
+            (Some((_, val, must_exist)), Some(eq)) => {
                 if *must_exist && !std::path::Path::new(val).is_file() {
                     // Pointing at a missing file breaks the feature outright
                     // (curl/openssl: cURL error 77); commented out, curl falls
@@ -1449,7 +1500,7 @@ fn patch_php_ini_paths(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
                     out.push_str(line);
                     m += 1;
                 } else {
-                    let prefix = line[..line.find('=').unwrap()].trim_end();
+                    let prefix = line[..eq].trim_end();
                     let nl = format!("{prefix} = \"{val}\"");
                     if nl != line {
                         n += 1;
@@ -1457,7 +1508,7 @@ fn patch_php_ini_paths(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
                     out.push_str(&nl);
                 }
             }
-            None => out.push_str(line),
+            _ => out.push_str(line),
         }
         out.push('\n');
     }
@@ -1553,7 +1604,7 @@ fn warn_missing_extensions(ini: &Path, ext_dir: &Path, log: &mut dyn FnMut(Strin
             continue;
         }
         let hit = ext_dir.join(format!("php_{name}.dll")).is_file()
-            || fs::read_dir(ext_dir).map_or(false, |rd| {
+            || fs::read_dir(ext_dir).is_ok_and(|rd| {
                 rd.flatten().any(|e| {
                     e.file_name()
                         .to_string_lossy()
@@ -1590,7 +1641,7 @@ fn gc_backups(basedir: &Path, keep: usize, log: &mut dyn FnMut(String, bool)) {
             Some((n, e.path()))
         })
         .collect();
-    kids.sort_by(|a, b| b.0.cmp(&a.0));
+    kids.sort_by_key(|k| std::cmp::Reverse(k.0));
     for (_, p) in kids.into_iter().skip(keep) {
         log(format!("removed backup {}", p.display()), false);
         remove_tree(&p);

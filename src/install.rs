@@ -120,7 +120,7 @@ pub(crate) fn php_dlls(basedir: &Path) -> (String, String) {
         rt = "php8ts".into();
     }
     if md.is_empty() {
-        md = format!("{}apache2_4", rt.trim_end_matches("ts").to_string());
+        md = format!("{}apache2_4", rt.trim_end_matches("ts"));
     }
     (rt, md)
 }
@@ -519,14 +519,95 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         }
     }
 
-    // Apache Lounge ships SSLCertificateFile "/server.crt": a leading slash on
-    // Windows means "root of the current drive". Point at our own certificate.
-    let ssl = extra.join("httpd-ssl.conf");
+    fix_ssl_conf(basedir, log);
+}
+
+/// `/name`: a file right at the root of the current drive. That is what the
+/// build-time placeholders of Apache Lounge's httpd-ssl.conf collapse to
+/// (`@exp_logfiledir@/error_log` -> `/error_log`). Deeper paths such as XAMPP's
+/// `/xampp/apache/logs/...` are real locations and are left alone.
+fn drive_root_file(value: &str) -> Option<&str> {
+    let name = value.strip_prefix('/')?;
+    (!name.is_empty() && !name.contains(['/', '\\'])).then_some(name)
+}
+
+/// Rewrite the first argument of a directive line with `f`, keeping the
+/// directive, the quoting and whatever follows it (log formats, a trailing `\`).
+fn rewrite_first_arg(line: &str, f: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let tr = line.trim_start();
+    let indent = &line[..line.len() - tr.len()];
+    let (directive, rest) = tr.split_at(tr.find(char::is_whitespace)?);
+    let arg = rest.trim_start();
+    let gap = &rest[..rest.len() - arg.len()];
+    let (value, tail, q) = match arg.strip_prefix('"') {
+        Some(inner) => {
+            let end = inner.find('"')?;
+            (&inner[..end], &inner[end + 1..], "\"")
+        }
+        None => {
+            let end = arg.find(char::is_whitespace).unwrap_or(arg.len());
+            (&arg[..end], &arg[end..], "")
+        }
+    };
+    let new = f(value)?;
+    Some(format!("{indent}{directive}{gap}{q}{new}{q}{tail}"))
+}
+
+/// Apache Lounge's httpd-ssl.conf names its certificate, its logs and its
+/// session cache at the drive root (`/server.crt`, `/error_log`,
+/// `shmcb:/ssl_scache`). A plain user cannot write to C:\, so the SSL virtual
+/// host fails to open its log and Apache exits right after `httpd -t` said
+/// "Syntax OK". Point them into this installation. Its DocumentRoot and cgi-bin
+/// are re-anchored onto the ServerRoot (apache/htdocs, the Apache Lounge demo
+/// page nothing grants access to: 403), while this package serves <basedir>/htdocs
+/// over http: https follows. Runs on every launch too, so a tree installed
+/// before this fix repairs itself.
+pub(crate) fn fix_ssl_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let ssl = basedir.join("apache\\conf\\extra\\httpd-ssl.conf");
     let Ok(txt) = fs::read_to_string(&ssl) else { return };
+    let srvroot = fwd(&basedir.join("apache"));
+    let base = fwd(basedir);
+    // apache/<dir> -> <basedir>/<dir>, when the package really has that folder.
+    let to_package = |v: &str, dir: &str| {
+        (v.eq_ignore_ascii_case(&format!("{srvroot}/{dir}")) && basedir.join(dir).is_dir())
+            .then(|| format!("{base}/{dir}"))
+    };
     let mut out = String::new();
     let mut fixed = 0usize;
+    let mut stock = 0usize;
     for line in txt.lines() {
         let tr = line.trim_start();
+        let word = tr.split_whitespace().next().unwrap_or("");
+        let moved = match word {
+            "DocumentRoot" => rewrite_first_arg(line, |v| to_package(v, "htdocs")),
+            "<Directory" => rewrite_first_arg(line, |v| to_package(v, "cgi-bin")),
+            // The stock placeholder name; the certificate is issued for localhost.
+            "ServerName" => rewrite_first_arg(line, |v| {
+                (v == "www.example.com:443").then(|| "localhost:443".to_string())
+            }),
+            // Relative log paths are ServerRoot-relative: <apache>/logs, next to
+            // the main error.log and access.log the panel's Logs button opens.
+            "ErrorLog" | "TransferLog" | "CustomLog" => rewrite_first_arg(line, |v| {
+                let name = drive_root_file(v)?;
+                let name = match name.strip_suffix("_log") {
+                    Some(stem) => format!("{stem}.log"),
+                    None => name.to_string(),
+                };
+                Some(format!("logs/{name}"))
+            }),
+            "SSLSessionCache" => rewrite_first_arg(line, |v| {
+                let (kind, path) = v.split_once(':')?;
+                let name = drive_root_file(path)?;
+                Some(format!("{kind}:{srvroot}/logs/{name}"))
+            }),
+            _ => None,
+        };
+        if let Some(nl) = moved {
+            out.push_str(&nl);
+            out.push('\n');
+            stock += 1;
+            continue;
+        }
         let directive = if tr.starts_with("SSLCertificateFile") {
             "conf\\ssl.crt\\server.crt"
         } else if tr.starts_with("SSLCertificateKeyFile") {
@@ -557,8 +638,16 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         }
         out.push('\n');
     }
-    if fixed > 0 && write_text(&ssl, &out).is_ok() {
-        log(format!("conf/extra/httpd-ssl.conf: {fixed} certificate path(s) pointed at this installation"), false);
+    if (fixed > 0 || stock > 0) && write_text(&ssl, &out).is_ok() {
+        if fixed > 0 {
+            log(format!("conf/extra/httpd-ssl.conf: {fixed} certificate path(s) pointed at this installation"), false);
+        }
+        if stock > 0 {
+            log(
+                format!("conf/extra/httpd-ssl.conf: {stock} stock setting(s) pointed at this installation (logs, session cache, document root, server name)"),
+                false,
+            );
+        }
     }
 }
 
@@ -646,7 +735,7 @@ fn pma_secret(basedir: &Path, log: &mut dyn FnMut(String, bool)) -> String {
         );
     }
     // Not cryptographic, but per-install and never published.
-    let mut x = (now_secs() as u64) ^ ((std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let mut x = now_secs() ^ ((std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let digits = b"0123456789abcdef";
     let mut s = String::new();
     while s.len() < 48 {
@@ -833,7 +922,7 @@ fn verify_running(
         stop.push(o.apache_port);
     }
     if !stop.is_empty() {
-        stop_module_blocking(&stop);
+        stop_module_blocking(basedir, &stop);
     }
     r
 }
@@ -853,15 +942,11 @@ fn port_free(port: u16) -> bool {
 /// such a server belongs to this installation and may be reused, one from
 /// another tree may not be disturbed.
 fn own_listener(basedir: &Path, port: u16) -> Option<u32> {
-    let root = basedir.to_string_lossy().to_lowercase().trim_end_matches(['\\', '/']).to_string();
     crate::netstat::tcp_table()
         .iter()
         .filter(|e| e.local == port && e.state == 2)
         .map(|e| e.pid)
-        .find(|pid| {
-            let p = crate::procs::process_path(*pid).to_lowercase();
-            p.starts_with(&root) && p[root.len()..].starts_with(['\\', '/'])
-        })
+        .find(|pid| crate::procs::pid_in_tree(basedir, *pid))
 }
 
 // ---------------------------------------------------------------- top level
@@ -920,7 +1005,7 @@ pub fn bootstrap(
                 info.available,
                 info.file,
                 if info.size > 0 {
-                    format!("{} MB", (info.size + 1_048_575) / 1_048_576)
+                    format!("{} MB", info.size.div_ceil(1_048_576))
                 } else {
                     "size ?".into()
                 }
@@ -1057,7 +1142,7 @@ pub fn bootstrap(
             crate::start_module_blocking(basedir, "MariaDB", &boot.mysql_exe)
                 .map_err(|e| format!("cannot start MariaDB to seed phpMyAdmin: {e}"))?;
             let r = seed_pmadb(basedir, o.mysql_port, log);
-            crate::stop_module_blocking(&[o.mysql_port]);
+            crate::stop_module_blocking(basedir, &[o.mysql_port]);
             r?;
         }
     }
@@ -1090,4 +1175,95 @@ pub fn bootstrap(
     update::sweep_tmp(basedir, log);
     log("installation complete".into(), false);
     Ok(boot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// httpd-ssl.conf lines as Apache Lounge 2.4.66 (251206) ships them.
+    const STOCK: &str = r#"SSLSessionCache        "shmcb:/ssl_scache(512000)"
+ErrorLog "/error_log"
+TransferLog "/access_log"
+CustomLog "/ssl_request_log" \
+          "%t %h %{SSL_PROTOCOL}x %{SSL_CIPHER}x \"%r\" %b"
+"#;
+
+    #[test]
+    fn drive_root_file_only_takes_single_segment_paths() {
+        assert_eq!(drive_root_file("/error_log"), Some("error_log"));
+        assert_eq!(drive_root_file("/xampp/apache/logs/error.log"), None);
+        assert_eq!(drive_root_file("logs/error.log"), None);
+        assert_eq!(drive_root_file("C:/x/error.log"), None);
+        assert_eq!(drive_root_file("/"), None);
+    }
+
+    #[test]
+    fn rewrite_first_arg_keeps_quotes_and_tail() {
+        let out = rewrite_first_arg("  CustomLog \"/ssl_request_log\" \\", |_| {
+            Some("logs/ssl_request.log".into())
+        });
+        assert_eq!(out.as_deref(), Some("  CustomLog \"logs/ssl_request.log\" \\"));
+        let out = rewrite_first_arg("ErrorLog logs/x.log", |v| Some(format!("{v}!")));
+        assert_eq!(out.as_deref(), Some("ErrorLog logs/x.log!"));
+        assert_eq!(rewrite_first_arg("ErrorLog", |_| Some(String::new())), None);
+    }
+
+    #[test]
+    fn fix_ssl_conf_moves_root_paths_into_the_tree() {
+        let base = std::env::temp_dir().join(format!("ramp-ssl-test-{}", std::process::id()));
+        let extra = base.join(r"apache\conf\extra");
+        fs::create_dir_all(&extra).unwrap();
+        fs::write(extra.join("httpd-ssl.conf"), STOCK).unwrap();
+        let mut lines = Vec::new();
+        fix_ssl_conf(&base, &mut |l, _| lines.push(l));
+        let got = fs::read_to_string(extra.join("httpd-ssl.conf")).unwrap();
+        let srv = fwd(&base.join("apache"));
+        assert!(got.contains(&format!("\"shmcb:{srv}/logs/ssl_scache(512000)\"")), "{got}");
+        assert!(got.contains("ErrorLog \"logs/error.log\""), "{got}");
+        assert!(got.contains("TransferLog \"logs/access.log\""), "{got}");
+        assert!(got.contains("CustomLog \"logs/ssl_request.log\" \\\n"), "{got}");
+        assert!(got.contains("%{SSL_CIPHER}x"), "{got}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        // Idempotent: a second pass finds nothing left to move.
+        lines.clear();
+        fix_ssl_conf(&base, &mut |l, _| lines.push(l));
+        assert!(lines.is_empty(), "{lines:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fix_ssl_conf_serves_the_package_htdocs_over_https() {
+        let base = std::env::temp_dir().join(format!("ramp-ssl-docroot-{}", std::process::id()));
+        let extra = base.join(r"apache\conf\extra");
+        fs::create_dir_all(&extra).unwrap();
+        fs::create_dir_all(base.join("htdocs")).unwrap();
+        fs::create_dir_all(base.join("cgi-bin")).unwrap();
+        let srv = fwd(&base.join("apache"));
+        let root = fwd(&base);
+        let conf = format!(
+            "DocumentRoot \"{srv}/htdocs\"\nServerName www.example.com:443\n<Directory \"{srv}/cgi-bin\">\n<Directory \"{srv}/icons\">\n"
+        );
+        fs::write(extra.join("httpd-ssl.conf"), &conf).unwrap();
+        fix_ssl_conf(&base, &mut |_, _| {});
+        let got = fs::read_to_string(extra.join("httpd-ssl.conf")).unwrap();
+        assert!(got.contains(&format!("DocumentRoot \"{root}/htdocs\"\n")), "{got}");
+        assert!(got.contains("ServerName localhost:443\n"), "{got}");
+        assert!(got.contains(&format!("<Directory \"{root}/cgi-bin\">\n")), "{got}");
+        // No icons/ folder in the package: that one stays on the ServerRoot.
+        assert!(got.contains(&format!("<Directory \"{srv}/icons\">\n")), "{got}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fix_ssl_conf_leaves_xampp_paths_alone() {
+        let base = std::env::temp_dir().join(format!("ramp-ssl-xampp-{}", std::process::id()));
+        let extra = base.join(r"apache\conf\extra");
+        fs::create_dir_all(&extra).unwrap();
+        let xampp = "ErrorLog \"/xampp/apache/logs/error.log\"\nSSLSessionCache \"shmcb:/xampp/apache/logs/ssl_scache(512000)\"\n";
+        fs::write(extra.join("httpd-ssl.conf"), xampp).unwrap();
+        fix_ssl_conf(&base, &mut |_, _| {});
+        assert_eq!(fs::read_to_string(extra.join("httpd-ssl.conf")).unwrap(), xampp);
+        let _ = fs::remove_dir_all(&base);
+    }
 }

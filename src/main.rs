@@ -1,8 +1,13 @@
+// GUI subsystem in release: no console window behind the panel. Debug builds
+// keep the console for the eprintln! traces.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod http;
 mod install;
 mod netstat;
 mod pe;
+mod ports;
 mod procs;
 mod update;
 
@@ -80,7 +85,13 @@ struct Module {
     old_running: Option<bool>, // None == Delphi's oldIsRunningByte = 2 (unknown)
     old_pid_count: usize,
     phase: Phase,
+    /// Clean MariaDB shutdown running on a thread: STOP_PENDING until it is done.
+    stop_job: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
 }
+
+const STOP_PENDING: u8 = 0;
+const STOP_CLEAN: u8 = 1;
+const STOP_KILLED: u8 = 2;
 
 struct App {
     basedir: PathBuf,
@@ -104,6 +115,9 @@ struct App {
     upd_comps: Vec<update::Comp>,
     upd_rx: Option<std::sync::mpsc::Receiver<UpdMsg>>,
     upd_busy: bool,
+    /// The worker is moving component trees (apply, restore, first-run install):
+    /// exiting now would leave apache/ or mysql/ half moved, so quitting waits.
+    upd_writes: bool,
     closing: bool,
 }
 
@@ -176,13 +190,47 @@ fn windows_version() -> String {
 }
 
 fn detect_basedir() -> PathBuf {
-    match std::env::var("XAMPP_BASEDIR") {
+    let dir = match std::env::var("XAMPP_BASEDIR") {
         Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    // Absolute, so it can be compared with the image paths of running servers.
+    std::path::absolute(&dir).unwrap_or(dir)
+}
+
+/// True when `dir` is one of cargo's profile folders (target\release,
+/// target\debug): `cargo clean` wipes those, servers and databases included.
+fn in_cargo_target(dir: &Path) -> bool {
+    dir.join(".fingerprint").is_dir() && dir.join(".cargo-lock").is_file()
+}
+
+const CARGO_TARGET_WARNING: &str = "ramp.exe is running from cargo's build folder: `cargo clean` would delete \
+everything installed here, databases included. Install from a release instead: release.ps1 -InstallDir <folder>, \
+or copy ramp.exe alone into a folder of its own.";
+
+/// ramp.ini mirrors the ports the servers really use: their configuration files
+/// win, so a port edited by hand in httpd.conf or my.ini is what the panel
+/// checks and opens. One line per port that moved.
+fn sync_ports_from_conf(basedir: &Path, cfg: &mut config::Config) -> Vec<String> {
+    let found = ports::read(basedir);
+    let mut moved = Vec::new();
+    for (what, file, slot, conf) in [
+        ("Apache", "httpd.conf", &mut cfg.apache_port, found.http),
+        ("Apache SSL", "httpd-ssl.conf", &mut cfg.apache_ssl_port, found.https),
+        ("MySQL", "my.ini", &mut cfg.mysql_port, found.mysql),
+    ] {
+        if let Some(port) = conf.filter(|p| *p != *slot) {
+            moved.push(format!(
+                "{what} port {} -> {port} in ramp.ini: {file} is what the server listens on",
+                *slot
+            ));
+            *slot = port;
+        }
     }
+    moved
 }
 
 fn exe_stem() -> String {
@@ -310,9 +358,8 @@ fn self_windows() -> Vec<isize> {
 
 // HWND -> ((pinned x, pinned y), original WNDPROC). Backs the classic
 // GWLP_WNDPROC hook below; the hook lives for the whole process lifetime.
-static PIN_MAP: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<isize, ([i32; 2], isize)>>,
-> = std::sync::OnceLock::new();
+type PinMap = HashMap<isize, ([i32; 2], isize)>;
+static PIN_MAP: std::sync::OnceLock<std::sync::Mutex<PinMap>> = std::sync::OnceLock::new();
 
 unsafe extern "system" fn pin_pos_proc(
     hwnd: HWND,
@@ -332,7 +379,10 @@ unsafe extern "system" fn pin_pos_proc(
             pos.x = pin[0];
             pos.y = pin[1];
         }
-        let orig: WNDPROC = Some(core::mem::transmute(orig));
+        let orig: WNDPROC = Some(core::mem::transmute::<
+            isize,
+            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+        >(orig));
         return CallWindowProcW(orig, hwnd, msg, wparam, lparam);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -476,7 +526,7 @@ static FDELTA: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (i32, i32)>>
 fn declared_size(title: &str) -> Option<(i32, i32)> {
     match title {
         TITLE_MAIN => Some((690, 460)),
-        TITLE_SETTINGS => Some((480, 440)),
+        TITLE_SETTINGS => Some((480, 464)),
         TITLE_UPDATES => Some((680, 430)),
         TITLE_FILES => Some((520, 380)),
         TITLE_ABOUT => Some((340, 230)),
@@ -697,7 +747,8 @@ fn start_module_blocking(basedir: &Path, name: &str, binary: &str) -> Result<(),
         }
         if procs::process_path(pid).is_empty() {
             return Err(format!(
-                "{name} exited during startup (check its error log)"
+                "{name} exited during startup{}",
+                error_log_tail(basedir, name)
             ));
         }
     }
@@ -707,29 +758,150 @@ fn start_module_blocking(basedir: &Path, name: &str, binary: &str) -> Result<(),
     ))
 }
 
-/// Blocking stop used by the updater: kills whatever holds the module's ports and
-/// waits for those ports to be free. Required before a swap, since on Windows a
-/// running exe cannot be moved out of the way.
-fn stop_module_blocking(ports: &[u16]) -> Vec<u32> {
-    let tab = netstat::tcp_table();
-    let mut killed = Vec::new();
-    for p in ports {
-        if let Some(e) = tab.iter().find(|e| e.local == *p) {
-            if terminate_pid(e.pid) {
-                killed.push(e.pid);
-            }
+/// The last lines of a server's own error log, so a failed start says why in
+/// the panel's log instead of sending the user off to find the file.
+fn error_log_tail(basedir: &Path, name: &str) -> String {
+    let rel = if name == "Apache" {
+        "apache\\logs\\error.log"
+    } else {
+        "mysql\\data\\mysql_error.log"
+    };
+    // Lossy: Apache writes OS messages in the ANSI code page.
+    let Ok(raw) = std::fs::read(basedir.join(rel)) else {
+        return " (check its error log)".into();
+    };
+    let txt = String::from_utf8_lossy(&raw);
+    let lines: Vec<&str> = txt.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(2)..].join(" | ");
+    if tail.is_empty() {
+        " (check its error log)".into()
+    } else {
+        format!(": {rel} ends with \"{tail}\"")
+    }
+}
+
+/// Blocking stop used by the updater: stops this installation's servers on the
+/// module's ports and waits for them to exit. Required before a swap, since on
+/// Windows a running exe cannot be moved out of the way. A process from another
+/// tree that holds one of the ports (IIS, another MySQL...) is never touched: the
+/// restart that follows reports the conflict instead. Returns the pids stopped.
+fn stop_module_blocking(basedir: &Path, ports: &[u16]) -> Vec<u32> {
+    let mut owners: Vec<u32> = Vec::new();
+    let mut images: Vec<String> = Vec::new();
+    let mut mysql_port: Option<u16> = None;
+    for e in netstat::tcp_table() {
+        if e.pid == 0 || !ports.contains(&e.local) || owners.contains(&e.pid) {
+            continue;
+        }
+        let path = procs::process_path(e.pid);
+        if !procs::path_in_tree(basedir, &path) {
+            continue;
+        }
+        let path = path.to_lowercase();
+        if mysql_port.is_none() && is_mysql_daemon(&path) {
+            mysql_port = Some(e.local);
+        }
+        if !images.contains(&path) {
+            images.push(path);
+        }
+        owners.push(e.pid);
+    }
+    if owners.is_empty() {
+        return owners;
+    }
+    // An Apache child serves the sockets its parent opened and may not show up
+    // in the TCP table: take every process running one of those executables.
+    for p in procs::list_processes() {
+        if owners.contains(&p.pid) {
+            continue;
+        }
+        let tail = format!("\\{}", p.name.to_lowercase());
+        if !images.iter().any(|i| i.ends_with(&tail)) {
+            continue;
+        }
+        if images.contains(&procs::process_path(p.pid).to_lowercase()) {
+            owners.push(p.pid);
         }
     }
-    if !killed.is_empty() {
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let tab = netstat::tcp_table();
-            if ports.iter().all(|p| !tab.iter().any(|e| e.local == *p)) {
-                break;
-            }
+    if let Some(port) = mysql_port {
+        mysql_shutdown_blocking(basedir, port, &owners, MYSQL_STOP_WAIT);
+    }
+    for &pid in &owners {
+        if !procs::process_path(pid).is_empty() {
+            terminate_pid(pid);
         }
     }
-    killed
+    for _ in 0..20 {
+        if owners.iter().all(|p| procs::process_path(*p).is_empty()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    owners
+}
+
+/// How long MariaDB gets to finish a clean shutdown before it is killed.
+const MYSQL_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn is_mysql_daemon(image: &str) -> bool {
+    let exe = image.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
+    exe == "mysqld.exe" || exe == "mariadbd.exe"
+}
+
+/// mariadb-admin since 10.5; older trees only ship mysqladmin.
+fn mysql_admin_tool(basedir: &Path) -> Option<PathBuf> {
+    ["mariadb-admin.exe", "mysqladmin.exe"]
+        .iter()
+        .map(|n| basedir.join("mysql\\bin").join(n))
+        .find(|p| p.is_file())
+}
+
+/// `mysqladmin shutdown` against this installation's MariaDB. Unlike
+/// TerminateProcess it lets InnoDB write its shutdown checkpoint: no crash
+/// recovery at the next start, and no datadir that a newer major refuses to
+/// upgrade. True once every pid in `pids` has exited; false when the tool is
+/// missing, was refused (root password set?) or `wait` elapsed, and the caller
+/// then falls back to killing.
+fn mysql_shutdown_blocking(
+    basedir: &Path,
+    port: u16,
+    pids: &[u32],
+    wait: std::time::Duration,
+) -> bool {
+    use std::os::windows::process::CommandExt;
+    let Some(tool) = mysql_admin_tool(basedir) else {
+        return false;
+    };
+    let spawned = std::process::Command::new(tool)
+        .args(["--user=root", "--protocol=tcp", "--connect-timeout=5"])
+        .arg(format!("--port={port}"))
+        .arg("shutdown")
+        .current_dir(basedir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // CREATE_NO_WINDOW: no console flashing up for the tool.
+        .creation_flags(0x0800_0000)
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if pids.iter().all(|p| procs::process_path(*p).is_empty()) {
+            return true;
+        }
+        if let Ok(Some(st)) = child.try_wait() {
+            if !st.success() {
+                return false;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 // ---------------------------------------------------------------- updater glue
@@ -745,8 +917,6 @@ enum UpdMsg {
     BootDone(Result<(String, String), String>),
 }
 
-/// MariaDB >= 10.5 refuses "InnoDB: upgrade after a crash". The panel stops
-/// servers with TerminateProcess, which leaves the redo log uncheckpointed. So
 /// PHP has no daemon of its own: prove a swapped-in build really runs by
 /// letting the CLI write a marker file. A tree missing its runtime DLLs or
 /// the Visual C++ redist never produces it.
@@ -787,18 +957,20 @@ fn smoke_php(basedir: &Path) -> Result<(), String> {
     Err("the PHP CLI hung for 30s".into())
 }
 
-/// before a MariaDB swap: start the old build, then shut it down cleanly with
-/// mysqladmin. Takes seconds, and is the official migration precondition.
+/// MariaDB >= 10.5 refuses "InnoDB: upgrade after a crash", and a server that
+/// was killed (clean shutdown refused, or stopped outside the panel) leaves the
+/// redo log uncheckpointed. So before a MariaDB swap: start the old build, then
+/// shut it down cleanly with mysqladmin. Takes seconds, and is the official
+/// migration precondition.
 fn checkpoint_mysql_datadir(
     basedir: &Path,
     binary: &str,
     port: u16,
     log: &mut dyn FnMut(String, bool),
 ) -> Result<(), String> {
-    let admin = basedir.join("mysql\\bin\\mysqladmin.exe");
-    if !admin.is_file() {
-        return Err("mysqladmin.exe not found: cannot checkpoint the datadir".into());
-    }
+    let Some(admin) = mysql_admin_tool(basedir) else {
+        return Err("neither mariadb-admin.exe nor mysqladmin.exe found: cannot checkpoint the datadir".into());
+    };
     log(
         "checkpointing the datadir with the old build (crash recovery can take a while)...".into(),
         false,
@@ -890,7 +1062,7 @@ fn run_system_upgrade(basedir: &Path, ports: &[u16], log: &mut dyn FnMut(String,
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     log(
-        format!("migrating the system tables ({name})...").into(),
+        format!("migrating the system tables ({name})..."),
         false,
     );
     let cmdline = format!(
@@ -907,11 +1079,11 @@ fn run_system_upgrade(basedir: &Path, ports: &[u16], log: &mut dyn FnMut(String,
                 }
             }
             log(
-                format!("{name} still running after 120s: check the datadir").into(),
+                format!("{name} still running after 120s: check the datadir"),
                 true,
             );
         }
-        Err(e) => log(format!("could not run {name}: {e}").into(), true),
+        Err(e) => log(format!("could not run {name}: {e}"), true),
     }
 }
 
@@ -988,6 +1160,7 @@ fn regenerate_server_cert(basedir: &Path, log: &mut dyn FnMut(String, bool)) -> 
 
 /// Stop the module, swap its tree, start it again. Blocking by design, so it
 /// runs on a worker thread (or under --update-apply), never on the UI thread.
+#[allow(clippy::too_many_arguments)]
 fn run_apply(
     basedir: &Path,
     info: &update::Info,
@@ -998,17 +1171,17 @@ fn run_apply(
     binary: &str,
     log: &mut dyn FnMut(String, bool),
 ) -> Result<update::Applied, String> {
-    let killed = stop_module_blocking(ports);
+    let killed = stop_module_blocking(basedir, ports);
     let was_running = !killed.is_empty();
     if killed.is_empty() {
         log(
-            format!("{mod_name} was not running; no port to release").into(),
+            format!("{mod_name} was not running; no port to release"),
             false,
         );
     } else {
         let list: Vec<String> = killed.iter().map(|p| p.to_string()).collect();
         log(
-            format!("{mod_name} stopped (pid {})", list.join(", ")).into(),
+            format!("{mod_name} stopped (pid {})", list.join(", ")),
             false,
         );
     }
@@ -1021,7 +1194,7 @@ fn run_apply(
     }
     let ap = update::apply(basedir, info, keep, limit, log, &mut |_done, _total| {})?;
     log(
-        format!("previous build kept in {}", ap.backup.display()).into(),
+        format!("previous build kept in {}", ap.backup.display()),
         false,
     );
     // The new tree may rename its daemon (mysqld.exe -> mariadbd.exe since 10.5):
@@ -1035,7 +1208,7 @@ fn run_apply(
         && info.comp != update::Comp::Phpmyadmin
         && smoke != binary
     {
-        log(format!("daemon renamed: {binary} -> {smoke}").into(), false);
+        log(format!("daemon renamed: {binary} -> {smoke}"), false);
     }
     // PHP is mod_php inside Apache: it owns no daemon. Prove the new CLI runs
     // by letting it write a marker file, then put Apache back only when it had
@@ -1065,7 +1238,7 @@ fn run_apply(
             }
             if was_running {
                 log(
-                    format!("{mod_name} is back up on the new build").into(),
+                    format!("{mod_name} is back up on the new build"),
                     false,
                 );
             } else {
@@ -1078,14 +1251,14 @@ fn run_apply(
                 };
                 log(msg, false);
                 if info.comp != update::Comp::Php && info.comp != update::Comp::Phpmyadmin {
-                    stop_module_blocking(ports);
-                    log(format!("{mod_name} left stopped, as before").into(), false);
+                    stop_module_blocking(basedir, ports);
+                    log(format!("{mod_name} left stopped, as before"), false);
                 }
             }
             Ok(ap)
         }
         Err(e) => {
-            log(e.clone().into(), true);
+            log(e.clone(), true);
             // Apache Lounge ships newer OpenSSL than the current tree; OpenSSL
             // 3.5+ rejects XAMPP's ancient 1024-bit certificate outright. The
             // old files stay in the backup, so replace them and retry once.
@@ -1099,12 +1272,12 @@ fn run_apply(
                     Ok(()) => match start_module_blocking(basedir, mod_name, &smoke) {
                         Ok(()) => started = true,
                         Err(e2) => log(
-                            format!("the new build still did not start: {e2}").into(),
+                            format!("the new build still did not start: {e2}"),
                             true,
                         ),
                     },
                     Err(ce) => log(
-                        format!("certificate regeneration failed: {ce}").into(),
+                        format!("certificate regeneration failed: {ce}"),
                         true,
                     ),
                 }
@@ -1112,16 +1285,16 @@ fn run_apply(
             if started {
                 if was_running {
                     log(
-                        format!("{mod_name} is back up on the new build").into(),
+                        format!("{mod_name} is back up on the new build"),
                         false,
                     );
                 } else {
                     log(
-                        format!("{mod_name} smoke test ok on the new build").into(),
+                        format!("{mod_name} smoke test ok on the new build"),
                         false,
                     );
-                    stop_module_blocking(ports);
-                    log(format!("{mod_name} left stopped, as before").into(), false);
+                    stop_module_blocking(basedir, ports);
+                    log(format!("{mod_name} left stopped, as before"), false);
                 }
                 return Ok(ap);
             }
@@ -1130,11 +1303,11 @@ fn run_apply(
             match start_module_blocking(basedir, mod_name, binary) {
                 Ok(()) => {
                     log(
-                        format!("{mod_name} is back on the previous build").into(),
+                        format!("{mod_name} is back on the previous build"),
                         false,
                     );
                     if !was_running {
-                        stop_module_blocking(ports);
+                        stop_module_blocking(basedir, ports);
                     }
                 }
                 Err(e2) => log(
@@ -1143,8 +1316,7 @@ fn run_apply(
                          manual restore: move {} back over {}",
                         ap.backup.join(info.comp.dir()).display(),
                         basedir.join(info.comp.dir()).display()
-                    )
-                    .into(),
+                    ),
                     true,
                 ),
             }
@@ -1164,12 +1336,12 @@ fn run_restore(
     binary: &str,
     log: &mut dyn FnMut(String, bool),
 ) -> Result<String, String> {
-    let killed = stop_module_blocking(ports);
+    let killed = stop_module_blocking(basedir, ports);
     let was_running = !killed.is_empty();
     if !killed.is_empty() {
         let list: Vec<String> = killed.iter().map(|p| p.to_string()).collect();
         log(
-            format!("{mod_name} stopped (pid {})", list.join(", ")).into(),
+            format!("{mod_name} stopped (pid {})", list.join(", ")),
             false,
         );
     }
@@ -1197,8 +1369,8 @@ fn run_restore(
     // Same rule as apply: the swap is proven by a smoke start, but a module
     // that was stopped must stay stopped.
     if !was_running {
-        stop_module_blocking(ports);
-        log(format!("{mod_name} left stopped, as before").into(), false);
+        stop_module_blocking(basedir, ports);
+        log(format!("{mod_name} left stopped, as before"), false);
     }
     Ok(exe)
 }
@@ -1271,7 +1443,8 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
                 LogType::Info,
             );
         }
-        if miss.len() < 4 {
+        // A repair has nothing missing: it must not take the hint branch below.
+        if !miss.is_empty() && miss.len() < 4 {
             add_log(
                 &mut a,
                 _ui,
@@ -1280,6 +1453,16 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
                     "missing component(s): {}. Reinstall them from the update window, or run ramp --first-run.",
                     miss.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
                 ),
+                LogType::Error,
+            );
+            return;
+        }
+        if !miss.is_empty() && in_cargo_target(&a.basedir) {
+            add_log(
+                &mut a,
+                _ui,
+                "update",
+                "first-run installation skipped: this folder belongs to cargo (see above)",
                 LogType::Error,
             );
             return;
@@ -1296,6 +1479,7 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
     {
         let mut a = app.borrow_mut();
         a.upd_busy = true;
+        a.upd_writes = true;
         a.upd_rx = Some(rx);
     }
     if let Some(w) = app.borrow().upd_win.clone() {
@@ -1354,6 +1538,7 @@ fn upd_apply(app: &AppRc, _ui: &Ui, row: usize) {
     {
         let mut a = app.borrow_mut();
         a.upd_busy = true;
+        a.upd_writes = true;
         a.upd_rx = Some(rx);
     }
     if let Some(w) = app.borrow().upd_win.clone() {
@@ -1390,7 +1575,7 @@ fn upd_row(
         ))),
         sel: sel as i32,
         size: match cur {
-            Some(i) if i.size > 0 => format!("{} MB", (i.size + 1_048_575) / 1_048_576).into(),
+            Some(i) if i.size > 0 => format!("{} MB", i.size.div_ceil(1_048_576)).into(),
             _ => "?".into(),
         },
         note: cur.map(|i| i.note.clone()).unwrap_or_default().into(),
@@ -1462,6 +1647,7 @@ fn upd_restore(app: &AppRc, _ui: &Ui, row: usize) {
     {
         let mut a = app.borrow_mut();
         a.upd_busy = true;
+        a.upd_writes = true;
         a.upd_rx = Some(rx);
     }
     if let Some(w) = app.borrow().upd_win.clone() {
@@ -1520,7 +1706,28 @@ fn upd_drain(app: &mut App, ui: &Ui) {
         None => return,
     };
     let mut pending = true;
-    while let Ok(m) = rx.try_recv() {
+    loop {
+        let m = match rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The worker went away without its final message (it panicked):
+                // release the panel instead of staying busy forever.
+                if pending {
+                    pending = false;
+                    app.upd_busy = false;
+                    app.upd_writes = false;
+                    add_log(
+                        app,
+                        ui,
+                        "update",
+                        "the update worker stopped unexpectedly: check the component folders before going on",
+                        LogType::Error,
+                    );
+                }
+                break;
+            }
+        };
         match m {
             UpdMsg::Log(l, warn) => add_log(
                 app,
@@ -1532,6 +1739,7 @@ fn upd_drain(app: &mut App, ui: &Ui) {
             UpdMsg::Checked(res) => {
                 pending = false;
                 app.upd_busy = false;
+                app.upd_writes = false;
                 app.upd_info.clear();
                 app.upd_sel.clear();
                 app.upd_model.clear();
@@ -1584,6 +1792,7 @@ fn upd_drain(app: &mut App, ui: &Ui) {
             UpdMsg::Finished(r) => {
                 pending = false;
                 app.upd_busy = false;
+                app.upd_writes = false;
                 match r {
                     Ok(ap) => {
                         add_log(
@@ -1614,6 +1823,7 @@ fn upd_drain(app: &mut App, ui: &Ui) {
             UpdMsg::Restored(comp, r) => {
                 pending = false;
                 app.upd_busy = false;
+                app.upd_writes = false;
                 match r {
                     Ok(exe) => {
                         add_log(
@@ -1640,6 +1850,7 @@ fn upd_drain(app: &mut App, ui: &Ui) {
             UpdMsg::BootDone(r) => {
                 pending = false;
                 app.upd_busy = false;
+                app.upd_writes = false;
                 match r {
                     Ok((apache_exe, mysql_exe)) => {
                         add_log(
@@ -1697,7 +1908,7 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
     show_and_anchor(&win, TITLE_ABOUT);
 }
 
-/// ---------------------------------------------------------------- dependencies
+// ---------------------------------------------------------------- dependencies
 
 /// True for the libraries the Visual C++ Redistributable owns: those are the
 /// ones a plain Windows install may genuinely lack.
@@ -1926,7 +2137,7 @@ fn shell_open(target: &str, operation: &str) -> bool {
     }
 }
 
-/// ---------------------------------------------------------------- logging
+// ---------------------------------------------------------------- logging
 
 fn add_log(app: &mut App, ui: &Ui, module: &str, text: &str, lt: LogType) {
     if lt == LogType::Debug && !app.cfg.show_debug {
@@ -2152,32 +2363,95 @@ fn start_module(app: &mut App, ui: &Ui, idx: usize) {
     }
 }
 
-fn stop_module(app: &mut App, ui: &Ui, idx: usize) {
-    app.modules[idx].phase = Phase::Stopping;
+/// Apache is killed outright. MariaDB first gets a clean `mysqladmin shutdown`
+/// and is only killed when that fails. `wait` blocks until it is down (quitting);
+/// otherwise the shutdown runs on a thread and update_module() reports it.
+fn stop_module(app: &mut App, ui: &Ui, idx: usize, wait: bool) {
     let name = app.modules[idx].name;
+    if let Some(flag) = app.modules[idx].stop_job.clone() {
+        if !wait {
+            add_log(
+                app,
+                ui,
+                name,
+                "Already shutting down: it gets killed if it is still up after 20 seconds",
+                LogType::Info,
+            );
+            return;
+        }
+        // Quitting while the background shutdown runs: let that one finish
+        // rather than start a second, competing one.
+        let deadline =
+            std::time::Instant::now() + MYSQL_STOP_WAIT + std::time::Duration::from_secs(2);
+        while flag.load(std::sync::atomic::Ordering::SeqCst) == STOP_PENDING
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        app.modules[idx].stop_job = None;
+        let outcome = flag.load(std::sync::atomic::Ordering::SeqCst);
+        if outcome != STOP_PENDING {
+            log_stop_outcome(app, ui, name, outcome);
+        }
+        return;
+    }
+    app.modules[idx].phase = Phase::Stopping;
     let pids = app.modules[idx].pids.clone();
     if pids.is_empty() {
         add_log(app, ui, name, "No PIDs found?!", LogType::Default);
         return;
     }
-    for pid in pids {
-        if name == "Apache" {
-            add_log(
-                app,
-                ui,
-                name,
-                &format!("Attempting to stop {name} (PID: {pid})"),
-                LogType::Default,
-            );
+    if name != "Apache" {
+        let list = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        add_log(
+            app,
+            ui,
+            name,
+            &format!("Attempting to stop {name} app... (PID: {list}, clean shutdown)"),
+            LogType::Default,
+        );
+        let port = app
+            .tcp
+            .iter()
+            .find(|e| e.state == 2 && pids.contains(&e.pid))
+            .map(|e| e.local)
+            .unwrap_or(app.cfg.mysql_port);
+        let basedir = app.basedir.clone();
+        let job = move || {
+            if mysql_shutdown_blocking(&basedir, port, &pids, MYSQL_STOP_WAIT) {
+                return STOP_CLEAN;
+            }
+            for &pid in &pids {
+                if !procs::process_path(pid).is_empty() {
+                    terminate_pid(pid);
+                }
+            }
+            STOP_KILLED
+        };
+        if wait {
+            let outcome = job();
+            log_stop_outcome(app, ui, name, outcome);
         } else {
-            add_log(
-                app,
-                ui,
-                name,
-                &format!("Attempting to stop {name} app... (PID: {pid})"),
-                LogType::Default,
-            );
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(STOP_PENDING));
+            app.modules[idx].stop_job = Some(flag.clone());
+            std::thread::spawn(move || {
+                flag.store(job(), std::sync::atomic::Ordering::SeqCst);
+            });
         }
+        return;
+    }
+    for pid in pids {
+        add_log(
+            app,
+            ui,
+            name,
+            &format!("Attempting to stop {name} (PID: {pid})"),
+            LogType::Default,
+        );
         if !terminate_pid(pid) {
             add_log(
                 app,
@@ -2197,13 +2471,32 @@ fn stop_module(app: &mut App, ui: &Ui, idx: usize) {
     }
 }
 
+fn log_stop_outcome(app: &mut App, ui: &Ui, name: &str, outcome: u8) {
+    if outcome == STOP_CLEAN {
+        add_log(app, ui, name, "Clean shutdown done", LogType::Debug);
+    } else {
+        add_log(
+            app,
+            ui,
+            name,
+            "No clean shutdown (mysqladmin missing, refused or too slow): process killed",
+            LogType::Error,
+        );
+    }
+}
+
 /// Port of tApache/tMySQL.UpdateStatus (services branch dropped).
 fn update_module(app: &mut App, ui: &Ui, idx: usize) {
-    let basedir_l = app
-        .basedir
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_lowercase();
+    let finished = app.modules[idx]
+        .stop_job
+        .as_ref()
+        .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|o| *o != STOP_PENDING);
+    if let Some(outcome) = finished {
+        app.modules[idx].stop_job = None;
+        let name = app.modules[idx].name;
+        log_stop_outcome(app, ui, name, outcome);
+    }
     let binary = app.modules[idx].binary.clone();
     let mut sorted: Vec<(u32, String)> = app
         .names
@@ -2216,8 +2509,7 @@ fn update_module(app: &mut App, ui: &Ui, idx: usize) {
         if !pname.starts_with(&binary) {
             continue;
         }
-        let path = procs::process_path(pid).replace('\\', "/").to_lowercase();
-        if !path.is_empty() && path.contains(&basedir_l) {
+        if procs::pid_in_tree(&app.basedir, pid) {
             pids.push(pid);
         }
     }
@@ -2234,7 +2526,7 @@ fn update_module(app: &mut App, ui: &Ui, idx: usize) {
     let running = app.modules[idx].running;
     let first = app.modules[idx].old_running.is_none();
     let prev = app.modules[idx].old_running;
-    let running_changed = prev.map_or(true, |o| o != running);
+    let running_changed = prev != Some(running);
     let count_changed = app.modules[idx].old_pid_count != app.modules[idx].pids.len();
     let was_starting = app.modules[idx].phase == Phase::Starting;
 
@@ -2499,7 +2791,7 @@ fn show_file_window(app: &AppRc, ui: &Ui, kind: &str, idx: usize) {
                 let row = app_cb.borrow().file_model.row_data(i as usize);
                 if let Some(r) = row {
                     let mut a = app_cb.borrow_mut();
-                    open_file_row(&mut a, &ui_cb, &r.path.to_string(), r.is_dir);
+                    open_file_row(&mut a, &ui_cb, r.path.as_ref(), r.is_dir);
                 }
             });
             let app_cb = app.clone();
@@ -2519,6 +2811,90 @@ fn show_file_window(app: &AppRc, ui: &Ui, kind: &str, idx: usize) {
     show_and_anchor(&win, TITLE_FILES);
 }
 
+/// Settings changed a port: write it into the server's own configuration, the
+/// only place the server reads it from. Before the first install there is no
+/// file yet: ramp.ini keeps the value and the installer writes it.
+fn apply_ports(app: &mut App, ui: &Ui, http: u16, https: u16, mysql: u16) {
+    type Writer = fn(&Path, u16) -> Result<usize, String>;
+    let changes: [(&str, usize, u16, u16, &str, Writer, &str); 3] = [
+        ("Apache", 0, app.cfg.apache_port, http, ports::HTTPD, ports::set_http, "httpd.conf"),
+        ("Apache SSL", 0, app.cfg.apache_ssl_port, https, ports::SSL, ports::set_https, "httpd-ssl.conf"),
+        ("MySQL", 1, app.cfg.mysql_port, mysql, ports::MYINI, ports::set_mysql, "my.ini, phpMyAdmin and php.ini"),
+    ];
+    let bd = app.basedir.clone();
+    let mut kept = [http, https, mysql];
+    for (i, (what, idx, old, new, file, write, files)) in changes.into_iter().enumerate() {
+        if old == new {
+            continue;
+        }
+        if !bd.join(file).is_file() {
+            add_log(
+                app,
+                ui,
+                "main",
+                &format!("{what} port {old} -> {new}: not installed yet, the installer will use it"),
+                LogType::Info,
+            );
+            continue;
+        }
+        match write(&bd, new) {
+            Ok(_) => {
+                add_log(
+                    app,
+                    ui,
+                    "main",
+                    &format!("{what} port {old} -> {new}: written to {files}"),
+                    LogType::Info,
+                );
+                let module = app.modules[idx].name;
+                if app.modules[idx].running {
+                    add_log(
+                        app,
+                        ui,
+                        module,
+                        &format!("Restart {module} to listen on port {new}"),
+                        LogType::Info,
+                    );
+                }
+            }
+            Err(e) => {
+                add_log(
+                    app,
+                    ui,
+                    "main",
+                    &format!("{what} port stays {old}, {new} could not be written: {e}"),
+                    LogType::Error,
+                );
+                kept[i] = old;
+                continue;
+            }
+        }
+        let taken = netstat::tcp_table()
+            .into_iter()
+            .find(|e| e.local == new && e.state == 2 && !procs::pid_in_tree(&bd, e.pid));
+        if let Some(e) = taken {
+            let who = app
+                .names
+                .get(&e.pid)
+                .cloned()
+                .unwrap_or_else(|| format!("PID {}", e.pid));
+            add_log(
+                app,
+                ui,
+                "main",
+                &format!("Port {new} is already in use by {who}: {what} will not start on it"),
+                LogType::Error,
+            );
+        }
+    }
+    let [http, https, mysql] = kept;
+    app.cfg.apache_port = http;
+    app.cfg.apache_ssl_port = https;
+    app.cfg.mysql_port = mysql;
+    app.modules[0].check_ports = vec![http, https];
+    app.modules[1].check_ports = vec![mysql];
+}
+
 fn show_settings_window(app: &AppRc, ui: &Ui) {
     let existing = app.borrow().settings_win.clone();
     let win = match existing {
@@ -2531,16 +2907,41 @@ fn show_settings_window(app: &AppRc, ui: &Ui) {
             let wc = w.clone();
             w.on_save(move || {
                 let mut a = app_cb.borrow_mut();
-                let parse = |s: SharedString, old: u16| -> u16 { s.trim().parse().unwrap_or(old) };
-                a.cfg.apache_port = parse(wc.get_apache_port(), a.cfg.apache_port);
-                a.cfg.apache_ssl_port = parse(wc.get_apache_ssl_port(), a.cfg.apache_ssl_port);
-                a.cfg.mysql_port = parse(wc.get_mysql_port(), a.cfg.mysql_port);
+                let port = |s: SharedString, what: &str| -> Result<u16, String> {
+                    s.trim()
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or_else(|| format!("{what} port \"{}\" is not a port number (1-65535)", s.trim()))
+                };
+                let (http, https, mysql) = match (
+                    port(wc.get_apache_port(), "Apache"),
+                    port(wc.get_apache_ssl_port(), "Apache SSL"),
+                    port(wc.get_mysql_port(), "MySQL"),
+                ) {
+                    (Ok(h), Ok(s), Ok(m)) if h != s => (h, s, m),
+                    (Ok(_), Ok(_), Ok(_)) => {
+                        add_log(
+                            &mut a,
+                            &ui_cb,
+                            "main",
+                            "Apache and Apache SSL cannot share a port",
+                            LogType::Error,
+                        );
+                        return;
+                    }
+                    (h, s, m) => {
+                        for e in [h.err(), s.err(), m.err()].into_iter().flatten() {
+                            add_log(&mut a, &ui_cb, "main", &e, LogType::Error);
+                        }
+                        return;
+                    }
+                };
                 a.cfg.check_ports = wc.get_check_ports();
                 a.cfg.show_debug = wc.get_show_debug();
                 a.cfg.editor = wc.get_editor().to_string();
                 a.cfg.browser = wc.get_browser().to_string();
-                a.modules[0].check_ports = vec![a.cfg.apache_port, a.cfg.apache_ssl_port];
-                a.modules[1].check_ports = vec![a.cfg.mysql_port];
+                apply_ports(&mut a, &ui_cb, http, https, mysql);
                 a.cfg.save(&a.ini_path);
                 add_log(&mut a, &ui_cb, "main", "Settings saved", LogType::Info);
                 let _ = wc.hide();
@@ -2569,15 +2970,27 @@ fn show_settings_window(app: &AppRc, ui: &Ui) {
     show_and_anchor(&win, TITLE_SETTINGS);
 }
 
-fn do_quit(app: &mut App, ui: &Ui) {
+/// False when quitting is refused: the update worker is moving component trees,
+/// and exiting would kill it between two renames.
+fn do_quit(app: &mut App, ui: &Ui) -> bool {
     if app.closing {
-        return;
+        return true;
+    }
+    if app.upd_writes {
+        add_log(
+            app,
+            ui,
+            "main",
+            "An update or installation is moving files: quit again once it has finished",
+            LogType::Error,
+        );
+        return false;
     }
     app.closing = true;
     add_log(app, ui, "main", "Deinitializing Modules", LogType::Default);
     for i in 0..app.modules.len() {
         if app.modules[i].running {
-            stop_module(app, ui, i);
+            stop_module(app, ui, i, true);
         }
     }
     add_log(
@@ -2596,12 +3009,16 @@ fn do_quit(app: &mut App, ui: &Ui) {
     app.cfg.save(&app.ini_path);
     write_log_file(app);
     let _ = slint::quit_event_loop();
+    true
 }
 
 // ---------------------------------------------------------------- entry point
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let basedir = detect_basedir();
+    // XAMPP_BASEDIR may name a folder that does not exist yet (`cargo run`
+    // points it at ../ramp-dev): ramp.ini and ramp.log go there from the start.
+    let _ = std::fs::create_dir_all(&basedir);
     let stem = exe_stem();
     let ini_path = basedir.join(format!("{stem}.ini"));
     let log_path = basedir.join(format!("{stem}.log"));
@@ -2617,7 +3034,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = std::fs::rename(&legacy_log, &log_path);
         }
     }
-    let cfg = config::Config::load(&ini_path);
+    let mut cfg = config::Config::load(&ini_path);
+    let port_sync = sync_ports_from_conf(&basedir, &mut cfg);
+    if !port_sync.is_empty() {
+        cfg.save(&ini_path);
+    }
 
     let modules = vec![
         Module {
@@ -2630,6 +3051,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             error: false,
             old_running: None,
             old_pid_count: 0,
+            stop_job: None,
             phase: Phase::Idle,
         },
         Module {
@@ -2642,6 +3064,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             error: false,
             old_running: None,
             old_pid_count: 0,
+            stop_job: None,
             phase: Phase::Idle,
         },
     ];
@@ -2668,6 +3091,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         upd_comps: Vec::new(),
         upd_rx: None,
         upd_busy: false,
+        upd_writes: false,
         closing: false,
     }));
 
@@ -2774,6 +3198,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &format!("XAMPP Installation Directory: \"{bd}\""),
             LogType::Default,
         );
+        if in_cargo_target(&basedir) {
+            add_log(&mut a, &ui, "main", CARGO_TARGET_WARNING, LogType::Error);
+        }
+        for line in &port_sync {
+            add_log(&mut a, &ui, "main", line, LogType::Info);
+        }
         // Self-heal the runtime configuration on every launch: the tree may
         // have been copied from another machine, so php.ini path directives
         // are re-rooted onto this basedir (and the apache\bin fallback mirror
@@ -2886,7 +3316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut a = app_cb.borrow_mut();
         let i = idx as usize;
         if a.modules[i].running {
-            stop_module(&mut a, &ui_cb, i);
+            stop_module(&mut a, &ui_cb, i, false);
         } else {
             start_module(&mut a, &ui_cb, i);
         }
@@ -2937,11 +3367,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_cb = app.clone();
     let ui_cb = ui.clone();
     main_window.window().on_close_requested(move || {
-        {
-            let mut a = app_cb.borrow_mut();
-            do_quit(&mut a, &ui_cb);
+        let mut a = app_cb.borrow_mut();
+        if do_quit(&mut a, &ui_cb) {
+            CloseRequestResponse::HideWindow
+        } else {
+            CloseRequestResponse::KeepWindowShown
         }
-        CloseRequestResponse::HideWindow
     });
 
     // Map directly at the centered position (see pre_center); the retry timer
@@ -3067,6 +3498,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app_t = app.clone();
         let ui_t = ui.clone();
         Timer::single_shot(std::time::Duration::from_millis(900), move || {
+            if in_cargo_target(&app_t.borrow().basedir)
+                && !install::missing(&app_t.borrow().basedir).is_empty()
+            {
+                let mut a = app_t.borrow_mut();
+                add_log(
+                    &mut a,
+                    &ui_t,
+                    "update",
+                    "CLI: install refused in cargo's build folder (see above)",
+                    LogType::Error,
+                );
+                do_quit(&mut a, &ui_t);
+                return;
+            }
             let (bd, o) = {
                 let a = app_t.borrow();
                 (
@@ -3480,7 +3925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &format!("TEST: {name} is running, stopping it"),
                             LogType::Info,
                         );
-                        stop_module(&mut a, &ui_t, i);
+                        stop_module(&mut a, &ui_t, i, false);
                     } else {
                         add_log(
                             &mut a,

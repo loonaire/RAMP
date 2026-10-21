@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use windows::core::PWSTR;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -64,6 +66,24 @@ pub fn process_path(pid: u32) -> String {
             Err(_) => String::new(),
         }
     }
+}
+
+/// True when the executable `path` lies inside the `root` tree (case-insensitive,
+/// either slash). A substring test would take C:\ramp-old for C:\ramp.
+pub fn path_in_tree(root: &Path, path: &str) -> bool {
+    let root = root.to_string_lossy().replace('/', "\\").to_lowercase();
+    let root = root.trim_end_matches('\\');
+    let path = path.replace('/', "\\").to_lowercase();
+    !root.is_empty()
+        && path.len() > root.len()
+        && path.starts_with(root)
+        && path.as_bytes()[root.len()] == b'\\'
+}
+
+/// True when process `pid` runs an executable from the `root` tree: only those
+/// belong to this installation and may be stopped by the panel.
+pub fn pid_in_tree(root: &Path, pid: u32) -> bool {
+    pid != 0 && path_in_tree(root, &process_path(pid))
 }
 
 pub fn process_name_map() -> std::collections::HashMap<u32, String> {
