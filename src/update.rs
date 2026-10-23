@@ -1,6 +1,5 @@
-//! Manual updater for the three stacks XAMPP bundles: Apache (Apache Lounge
-//! build ), MariaDB and PHP. Feeds are the upstream ones, because XAMPP's own
-//! Windows distribution is frozen at 8.2.12.
+//! Manual updater for the bundled stacks: Apache (Apache Lounge build), MariaDB,
+//! PHP and phpMyAdmin, straight from their upstream feeds.
 //!
 //! Everything file-system related runs off the UI thread; the UI thread owns
 //! start/stop of the modules (it owns `App` ).
@@ -279,7 +278,7 @@ pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, Strin
                 continue;
             }
         }
-        // XAMPP ships ZTS PHP (mod_php); "ts-vsNN-x64" is the matching flavour.
+        // mod_php needs a thread-safe (ZTS) build: "ts-vsNN-x64" is that flavour.
         let flavors: Vec<&serde_json::Value> = e
             .as_object()
             .map(|o| {
@@ -659,7 +658,7 @@ pub fn feed_mariadb(
 /// One-line label for the target dropdown: "13.0.2 (Rolling)".
 /// phpMyAdmin: GitHub releases announce the versions, the canonical
 /// files.phpmyadmin.net host carries the zips plus a plain `<zip>.sha256` sidecar.
-/// XAMPP ships the all-languages flavour (the locale/ tree is fully populated).
+/// The all-languages flavour, so the locale/ tree is fully populated.
 pub fn feed_phpmyadmin(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, String> {
     let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
     let txt = http::http_get_text(PMA_API)?;
@@ -1213,7 +1212,8 @@ pub fn apply(
                     fs::copy(&cfg, root.join("config.inc.php")).map_err(|e| e.to_string())?;
                     log("config.inc.php kept".into(), false);
                 }
-                // XAMPP's cache/upload dirs are not part of the official zip.
+                // The cache/upload dirs config.inc.php points at are not part
+                // of the official zip.
                 copy_if_missing(&old, &root, "tmp", log);
                 copy_if_missing(&old, &root, "upload_tmp", log);
             }
@@ -1283,8 +1283,12 @@ pub fn apply(
 
 // ---------------------------------------------------------- compatibility patches
 
+/// Where mod_php is wired in, as httpd.conf includes it.
+pub const PHP_CONF: &str = "apache\\conf\\extra\\httpd-ramp.conf";
+const PHP_CONF_INCLUDE: &str = "conf/extra/httpd-ramp.conf";
+
 /// Re-assert known compatibility fixes after swapping Apache or PHP.
-/// These fix crashes that appear when the new PHP meets the XAMPP Apache config:
+/// These fix crashes that appear when a new PHP meets an existing Apache config:
 ///  - PHPINIDir + mod_php >= 8.5 => httpd worker crash (0xC0000005) on the first
 ///    request. The control panel exports PHPRC in the httpd.exe process
 ///    environment instead (with_php_env in main.rs); the conf's SetEnv PHPRC
@@ -1294,10 +1298,11 @@ pub fn apply(
 ///
 /// Idempotent: only rewrites files when something actually changes.
 pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    adopt_php_conf(basedir, log);
     // Path portability applies regardless of the PHP version: the tree is
-    // unzipped wherever the user puts it, and the shipped php.ini still carries
-    // XAMPP's hardcoded `\xampp\...` references plus possibly a stale
-    // extension_dir baked in at build time.
+    // unzipped wherever the user puts it, and a php.ini carried over from
+    // another package may hardcode drive-relative `\<folder>\...` paths, plus
+    // possibly a stale extension_dir baked in at build time.
     patch_php_ini_paths(basedir, log);
     ensure_ini_fallback(basedir, log);
     disable_php_cgi_alias(basedir, log);
@@ -1310,7 +1315,7 @@ pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         log("compat: PHP < 8.5 (or unknown), no version-specific patch needed".into(), false);
         return;
     }
-    patch_xampp_conf(basedir, log);
+    patch_php_conf(basedir, log);
     patch_php_ini(basedir, log);
 }
 
@@ -1318,14 +1323,92 @@ fn read_text(p: &Path) -> Option<String> {
     fs::read_to_string(p).ok()
 }
 
-fn patch_xampp_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
-    let f = basedir
-        .join("apache")
-        .join("conf")
-        .join("extra")
-        .join("httpd-xampp.conf");
+/// Trees set up before PHP_CONF got its name load mod_php from another
+/// conf/extra file. Adopt that file under PHP_CONF, the name every patch looks
+/// for, and point httpd.conf's Include at it. The file is recognised by what it
+/// does (it loads php_module), not by its old name.
+fn adopt_php_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let target = basedir.join(PHP_CONF);
+    let httpd = basedir.join("apache\\conf\\httpd.conf");
+    if target.exists() {
+        return;
+    }
+    let Some(text) = read_text(&httpd) else {
+        return;
+    };
+    let include_arg = |line: &str| -> Option<String> {
+        let rest = line.trim_start().strip_prefix("Include")?;
+        let rest = rest.strip_prefix("Optional").unwrap_or(rest);
+        rest.starts_with(char::is_whitespace)
+            .then(|| rest.trim().trim_matches('"').to_string())
+    };
+    let loads_php = |p: &Path| {
+        read_text(p).is_some_and(|body| {
+            body.lines().any(|l| {
+                let l = l.trim_start().to_ascii_lowercase();
+                l.starts_with("loadmodule") && l.contains("php_module")
+            })
+        })
+    };
+    let resolve = |arg: &str| {
+        let rel = arg.replace('/', "\\");
+        if Path::new(&rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            basedir.join("apache").join(rel)
+        }
+    };
+    let Some((arg, old)) = text
+        .lines()
+        .filter_map(include_arg)
+        .map(|a| {
+            let p = resolve(&a);
+            (a, p)
+        })
+        .find(|(_, p)| loads_php(p))
+    else {
+        return;
+    };
+    // Only a file sitting where the new one goes is moved: an Include that
+    // points into another tree is that tree's business.
+    let dir = |p: &Path| p.parent().and_then(|d| fs::canonicalize(d).ok());
+    if dir(&old).is_none() || dir(&old) != dir(&target) {
+        return;
+    }
+    if let Err(e) = fs::rename(&old, &target) {
+        log(format!("compat: cannot rename {} to {}: {e}", old.display(), target.display()), true);
+        return;
+    }
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if include_arg(line).as_deref() == Some(arg.as_str()) {
+            out.push_str(&line.replace(&arg, PHP_CONF_INCLUDE));
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(nl);
+    }
+    if let Err(e) = fs::write(&httpd, out) {
+        // httpd.conf still names the old file: put it back.
+        let _ = fs::rename(&target, &old);
+        log(format!("compat: cannot write {}: {e}", httpd.display()), true);
+        return;
+    }
+    let old_name = old
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    log(
+        format!("compat: conf/extra/{old_name} renamed to httpd-ramp.conf (it wires PHP into Apache)"),
+        false,
+    );
+}
+
+fn patch_php_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let f = basedir.join(PHP_CONF);
     let Some(text) = read_text(&f) else {
-        log("compat: httpd-xampp.conf not readable, skipped".into(), true);
+        log("compat: httpd-ramp.conf not readable, skipped".into(), true);
         return;
     };
     let mut has_phprc = false;
@@ -1352,35 +1435,31 @@ fn patch_xampp_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         out.push('\n');
     }
     if commented == 0 {
-        log("compat: PHPINIDir already absent from httpd-xampp.conf".into(), false);
+        log("compat: PHPINIDir already absent from httpd-ramp.conf".into(), false);
         return;
     }
     if !has_phprc {
         let phpdir = basedir.join("php").to_string_lossy().replace('\\', "/");
         out.push_str(&format!("SetEnv PHPRC \"{phpdir}\"\n"));
-        log("compat: added SetEnv PHPRC to httpd-xampp.conf".into(), false);
+        log("compat: added SetEnv PHPRC to httpd-ramp.conf".into(), false);
     }
     if let Err(e) = fs::write(&f, out) {
         log(format!("compat: cannot write {}: {e}", f.display()), true);
     } else {
         log(
-            format!("compat: PHPINIDir disabled in httpd-xampp.conf ({commented} line(s))"),
+            format!("compat: PHPINIDir disabled in httpd-ramp.conf ({commented} line(s))"),
             false,
         );
     }
 }
 
-/// XAMPP's httpd-xampp.conf maps /php-cgi/ onto the php folder and opens
+/// Older PHP configurations map /php-cgi/ onto the php folder and open
 /// php-cgi.exe to every client, although PHP runs as mod_php (the CGI handler is
 /// commented out). That alias is the CVE-2024-4577 entry point (argument
 /// injection into php-cgi.exe) and Apache listens on every interface, so it is
 /// commented out, unless a live `Action ... php-cgi` line still relies on it.
 fn disable_php_cgi_alias(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
-    let f = basedir
-        .join("apache")
-        .join("conf")
-        .join("extra")
-        .join("httpd-xampp.conf");
+    let f = basedir.join(PHP_CONF);
     let Some(text) = read_text(&f) else {
         return;
     };
@@ -1409,7 +1488,7 @@ fn disable_php_cgi_alias(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         log(format!("compat: cannot write {}: {e}", f.display()), true);
     } else {
         log(
-            "compat: /php-cgi/ alias disabled in httpd-xampp.conf (PHP runs as mod_php; the alias exposed php-cgi.exe, CVE-2024-4577)".into(),
+            "compat: /php-cgi/ alias disabled in httpd-ramp.conf (PHP runs as mod_php; the alias exposed php-cgi.exe, CVE-2024-4577)".into(),
             false,
         );
     }
@@ -1450,11 +1529,11 @@ fn patch_php_ini(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     }
 }
 
-/// php.ini directives that must point inside the package tree. XAMPP's own
-/// php.ini hardcodes `\xampp\...` (resolves to a `xampp` folder on the current
-/// drive, which only exists on a classic install) and the build machine's
-/// absolute path may be baked into `extension_dir`. XAMPP's layout matches the
-/// package layout 1:1, so these keys are re-rooted onto the current basedir
+/// php.ini directives that must point inside the package tree. A php.ini
+/// carried over from another package may hardcode drive-relative paths
+/// (`\<folder>\php\ext` resolves on whatever drive is current), and the build
+/// machine's absolute path may be baked into `extension_dir`. The keys below
+/// follow the package layout, so they are re-rooted onto the current basedir
 /// (idempotent: already-correct values are left untouched).
 fn ini_path_keys(basedir: &Path) -> Vec<(&'static str, String, bool)> {
     let abs = |sub: &str| basedir.join(sub).to_string_lossy().into_owned();
@@ -1754,5 +1833,59 @@ pub fn rollback(basedir: &Path, comp: Comp, backup: &Path, log: &mut dyn FnMut(S
     }
     if comp == Comp::Apache || comp == Comp::Php {
         patch_compat(basedir, log);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(name: &str, httpd: &str, old: Option<(&str, &str)>) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("ramp-adopt-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(r"apache\conf\extra")).unwrap();
+        fs::write(base.join(r"apache\conf\httpd.conf"), httpd).unwrap();
+        if let Some((file, body)) = old {
+            fs::write(base.join(r"apache\conf\extra").join(file), body).unwrap();
+        }
+        base
+    }
+
+    const PHP: &str = "LoadModule php_module \"c:/x/php/php8apache2_4.dll\"\n";
+
+    #[test]
+    fn the_file_that_loads_php_is_adopted() {
+        let httpd = "#Include \"conf/extra/httpd-legacy.conf\"\r\nInclude conf/extra/httpd-ssl.conf\r\nInclude \"conf/extra/httpd-legacy.conf\"\r\n";
+        let base = tree("ok", httpd, Some(("httpd-legacy.conf", PHP)));
+        fs::write(base.join(r"apache\conf\extra\httpd-ssl.conf"), "Listen 443\n").unwrap();
+        let mut lines = Vec::new();
+        adopt_php_conf(&base, &mut |l, _| lines.push(l));
+        assert_eq!(fs::read_to_string(base.join(PHP_CONF)).unwrap(), PHP);
+        assert!(!base.join(r"apache\conf\extra\httpd-legacy.conf").exists());
+        assert_eq!(
+            fs::read_to_string(base.join(r"apache\conf\httpd.conf")).unwrap(),
+            "#Include \"conf/extra/httpd-legacy.conf\"\r\nInclude conf/extra/httpd-ssl.conf\r\nInclude \"conf/extra/httpd-ramp.conf\"\r\n"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        // Done once: a second pass changes nothing.
+        lines.clear();
+        adopt_php_conf(&base, &mut |l, _| lines.push(l));
+        assert!(lines.is_empty(), "{lines:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_include_into_another_tree_is_left_alone() {
+        let other = std::env::temp_dir().join(format!("ramp-adopt-other-{}", std::process::id()));
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("php.conf"), PHP).unwrap();
+        let httpd = format!("Include \"{}\"\n", other.join("php.conf").to_string_lossy().replace('\\', "/"));
+        let base = tree("far", &httpd, None);
+        adopt_php_conf(&base, &mut |_, _| {});
+        assert!(other.join("php.conf").is_file());
+        assert!(!base.join(PHP_CONF).exists());
+        assert_eq!(fs::read_to_string(base.join(r"apache\conf\httpd.conf")).unwrap(), httpd);
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&other);
     }
 }

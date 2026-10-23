@@ -23,7 +23,7 @@ use std::{
 };
 
 const T_HTTPD: &str = include_str!("../templates/httpd.conf");
-const T_XAMPP: &str = include_str!("../templates/httpd-xampp.conf");
+const T_PHPCONF: &str = include_str!("../templates/httpd-ramp.conf");
 const T_MYINI: &str = include_str!("../templates/my.ini");
 const T_PHPINI: &str = include_str!("../templates/php.ini");
 const T_PMA: &str = include_str!("../templates/config.inc.php");
@@ -128,7 +128,7 @@ pub(crate) fn php_dlls(basedir: &Path) -> (String, String) {
 /// True when the Apache configuration already names the PHP libraries that are
 /// on disk: catches a PHP major/minor change and an NTS-vs-ZTS mismatch.
 fn php_wiring_current(basedir: &Path) -> bool {
-    let Ok(txt) = fs::read_to_string(basedir.join("apache\\conf\\extra\\httpd-xampp.conf")) else {
+    let Ok(txt) = fs::read_to_string(basedir.join(update::PHP_CONF)) else {
         return false;
     };
     let lower = txt.to_lowercase().replace('\\', "/");
@@ -324,18 +324,20 @@ fn drive_paths(txt: &str) -> Vec<String> {
     out
 }
 
-/// The tree an Apache build was made on: `C:/Apache24-64` for an Apache Lounge
-/// archive, found by walking the directories those paths live in (strays such
-/// as `D:/server.crt` cannot join the majority and are dropped).
-/// A stock Windows location that is never an earlier copy of this installation:
-/// Apache's own examples point at C:/Users/*/My Documents and the like, and
-/// rewriting one of those breaks the module instead of moving it.
+/// A stock Windows location: Apache's own examples point at C:/Users/*/My
+/// Documents and the like, and rewriting one of those breaks the module
+/// instead of moving it. Only consulted for roots that do not look like an
+/// earlier location of a package (see reanchor_extras): a package unzipped on
+/// the Desktop lives under C:/Users too.
 fn foreign_system_path(lower: &str) -> bool {
     ["/users/", "/programdata", "/program files", "/windows/", "/appdata"]
         .iter()
         .any(|p| lower.contains(p))
 }
 
+/// The tree an Apache build was made on: `C:/Apache24-64` for an Apache Lounge
+/// archive, found by walking the directories those paths live in (strays such
+/// as `D:/server.crt` cannot join the majority and are dropped).
 fn stock_root(txt: &str) -> Option<String> {
     let parents: Vec<String> = drive_paths(txt)
         .iter()
@@ -390,9 +392,6 @@ fn outside_root(basedir: &Path, rel: &str) -> bool {
 
 const VHOSTS_NOTE: &str = "# RAMP\n# The virtual hosts that ship with an Apache build point at the machine\n# that built it, and a _default_:80 host there would shadow this\n# installation. httpd.conf already sets DocumentRoot, the /phpmyadmin\n# alias and the port, so add your own hosts here.\n";
 
-/// Re-anchor the conf/extra files the Apache archive brought along: they name
-/// the build machine, which no portable tree can honour. Only untouched stock
-/// files are touched, never the RAMP files this installer writes.
 /// Put back a directory that an earlier build duplicated: replacing the package
 /// root by the ServerRoot turned <basedir>/apache/logs into
 /// <basedir>/apache/apache/logs, and httpd -t then refused the vhost log path.
@@ -424,6 +423,9 @@ fn collapse_doubled(txt: &mut String, base: &str, comp: &str) -> bool {
     hit
 }
 
+/// Re-anchor the conf/extra files onto this location: the Apache archive's
+/// name the build machine, and a moved package's still name its old folder.
+/// Never the RAMP file this installer writes.
 fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     let extra = basedir.join("apache\\conf\\extra");
     let srvroot = fwd(&basedir.join("apache"));
@@ -439,7 +441,7 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     for e in rd.flatten() {
         let p = e.path();
         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        if !name.ends_with(".conf") || name == "httpd-xampp.conf" {
+        if !name.ends_with(".conf") || name == "httpd-ramp.conf" {
             continue;
         }
         names.push(name);
@@ -474,7 +476,7 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
         if root.eq_ignore_ascii_case(&srvroot) || root.eq_ignore_ascii_case(&base) {
             continue;
         }
-        if root.contains('*') || foreign_system_path(&root.to_lowercase()) {
+        if root.contains('*') {
             // Stock examples such as C:/Users/*/My Documents are not this
             // installation's business; Apache accepts them as they are.
             continue;
@@ -491,6 +493,15 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
             })
             .collect();
         if !direct.iter().any(|s| COMPONENTS.contains(&s.as_str())) {
+            continue;
+        }
+        // <old>/apache/... or a root ending in /apache: an earlier location of
+        // a package like this one, which may well have sat under C:/Users (the
+        // Desktop, Documents). Anything else in a system folder is a stock
+        // example and stays as it is.
+        let former_package =
+            direct.iter().any(|s| s == "apache") || root.to_lowercase().ends_with("/apache");
+        if !former_package && foreign_system_path(&root.to_lowercase()) {
             continue;
         }
         // <oldroot>/apache/... means <oldroot> was the package folder itself;
@@ -524,8 +535,8 @@ fn reanchor_extras(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
 
 /// `/name`: a file right at the root of the current drive. That is what the
 /// build-time placeholders of Apache Lounge's httpd-ssl.conf collapse to
-/// (`@exp_logfiledir@/error_log` -> `/error_log`). Deeper paths such as XAMPP's
-/// `/xampp/apache/logs/...` are real locations and are left alone.
+/// (`@exp_logfiledir@/error_log` -> `/error_log`). Deeper paths such as
+/// `/web/apache/logs/...` are real locations and are left alone.
 fn drive_root_file(value: &str) -> Option<&str> {
     let name = value.strip_prefix('/')?;
     (!name.is_empty() && !name.contains(['/', '\\'])).then_some(name)
@@ -652,8 +663,9 @@ pub(crate) fn fix_ssl_conf(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
 }
 
 /// A httpd.conf that `Include`s a conf/extra file the tree does not have can
-/// only ever be rejected: it came from another build (XAMPP ships httpd-proxy.conf
-/// and httpd-ajp.conf, Apache Lounge does not) or from a half-finished install.
+/// only ever be rejected: it came from another build (some packages ship
+/// httpd-proxy.conf and httpd-ajp.conf, Apache Lounge does not) or from a
+/// half-finished install.
 fn conf_references_missing(basedir: &Path) -> bool {
     let Ok(txt) = fs::read_to_string(basedir.join("apache\\conf\\httpd.conf")) else {
         return true;
@@ -702,12 +714,12 @@ fn write_apache_conf(
         &fill(T_HTTPD, &map),
     )?;
     write_text(
-        &basedir.join("apache\\conf\\extra\\httpd-xampp.conf"),
-        &fill(T_XAMPP, &map),
+        &basedir.join(update::PHP_CONF),
+        &fill(T_PHPCONF, &map),
     )?;
     log(
         format!(
-            "httpd.conf + conf/extra/httpd-xampp.conf written for this location, listening on {port}"
+            "httpd.conf + conf/extra/httpd-ramp.conf written for this location, listening on {port}"
         ),
         false,
     );
@@ -957,7 +969,7 @@ fn own_listener(basedir: &Path, port: u16) -> Option<u32> {
 pub fn needs_repair(basedir: &Path) -> bool {
     let apache = update::installed_opt(basedir, Comp::Apache).is_some()
         && (outside_root(basedir, "apache\\conf\\httpd.conf")
-            || outside_root(basedir, "apache\\conf\\extra\\httpd-xampp.conf")
+            || outside_root(basedir, update::PHP_CONF)
             || conf_references_missing(basedir));
     let mysql =
         update::installed_opt(basedir, Comp::Mysql).is_some() && outside_root(basedir, "mysql\\bin\\my.ini");
@@ -1072,12 +1084,12 @@ pub fn bootstrap(
             mkdir(&basedir.join(d))?;
         }
         let broken_includes =
-            basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file() && conf_references_missing(basedir);
-        let moved = basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file()
+            basedir.join(update::PHP_CONF).is_file() && conf_references_missing(basedir);
+        let moved = basedir.join(update::PHP_CONF).is_file()
             && (outside_root(basedir, "apache\\conf\\httpd.conf")
-                || outside_root(basedir, "apache\\conf\\extra\\httpd-xampp.conf"));
+                || outside_root(basedir, update::PHP_CONF));
         let php_wiring = !php_wiring_current(basedir);
-        if !basedir.join("apache\\conf\\extra\\httpd-xampp.conf").is_file()
+        if !basedir.join(update::PHP_CONF).is_file()
             || broken_includes
             || moved
             || php_wiring
@@ -1089,7 +1101,7 @@ pub fn bootstrap(
                 log("httpd.conf still named another installation: rewritten".into(), true);
             }
             if php_wiring {
-                log("the PHP libraries named in httpd-xampp.conf are not the ones on disk: rewriting it".into(), true);
+                log("the PHP libraries named in httpd-ramp.conf are not the ones on disk: rewriting it".into(), true);
             }
             write_apache_conf(basedir, o.apache_port, log)?;
         }
@@ -1192,7 +1204,7 @@ CustomLog "/ssl_request_log" \
     #[test]
     fn drive_root_file_only_takes_single_segment_paths() {
         assert_eq!(drive_root_file("/error_log"), Some("error_log"));
-        assert_eq!(drive_root_file("/xampp/apache/logs/error.log"), None);
+        assert_eq!(drive_root_file("/web/apache/logs/error.log"), None);
         assert_eq!(drive_root_file("logs/error.log"), None);
         assert_eq!(drive_root_file("C:/x/error.log"), None);
         assert_eq!(drive_root_file("/"), None);
@@ -1256,14 +1268,55 @@ CustomLog "/ssl_request_log" \
     }
 
     #[test]
-    fn fix_ssl_conf_leaves_xampp_paths_alone() {
-        let base = std::env::temp_dir().join(format!("ramp-ssl-xampp-{}", std::process::id()));
+    fn fix_ssl_conf_leaves_deeper_root_paths_alone() {
+        let base = std::env::temp_dir().join(format!("ramp-ssl-deeper-{}", std::process::id()));
         let extra = base.join(r"apache\conf\extra");
         fs::create_dir_all(&extra).unwrap();
-        let xampp = "ErrorLog \"/xampp/apache/logs/error.log\"\nSSLSessionCache \"shmcb:/xampp/apache/logs/ssl_scache(512000)\"\n";
-        fs::write(extra.join("httpd-ssl.conf"), xampp).unwrap();
+        let conf = "ErrorLog \"/web/apache/logs/error.log\"\nSSLSessionCache \"shmcb:/web/apache/logs/ssl_scache(512000)\"\n";
+        fs::write(extra.join("httpd-ssl.conf"), conf).unwrap();
         fix_ssl_conf(&base, &mut |_, _| {});
-        assert_eq!(fs::read_to_string(extra.join("httpd-ssl.conf")).unwrap(), xampp);
+        assert_eq!(fs::read_to_string(extra.join("httpd-ssl.conf")).unwrap(), conf);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A package tree under `base`, with one conf/extra file.
+    fn extra_tree(name: &str, file: &str, conf: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("ramp-reanchor-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in [r"apache\conf\extra", "htdocs", "cgi-bin"] {
+            fs::create_dir_all(base.join(d)).unwrap();
+        }
+        fs::write(base.join(r"apache\conf\extra").join(file), conf).unwrap();
+        base
+    }
+
+    #[test]
+    fn a_package_moved_from_the_desktop_is_reanchored() {
+        let old = "C:/Users/someone/Desktop/RAMP";
+        let conf = format!(
+            "DocumentRoot \"{old}/htdocs\"\n<Directory \"{old}/cgi-bin\">\nSSLSessionCache        \"shmcb:{old}/apache/logs/ssl_scache(512000)\"\n"
+        );
+        // The new location is under C:/Users as well (the temp folder).
+        let base = extra_tree("moved", "httpd-ssl.conf", &conf);
+        reanchor_extras(&base, &mut |_, _| {});
+        let got = fs::read_to_string(base.join(r"apache\conf\extra\httpd-ssl.conf")).unwrap();
+        let new = fwd(&base);
+        assert!(!got.contains(old), "{got}");
+        assert!(got.contains(&format!("DocumentRoot \"{new}/htdocs\"")), "{got}");
+        assert!(got.contains(&format!("<Directory \"{new}/cgi-bin\">")), "{got}");
+        assert!(got.contains(&format!("\"shmcb:{new}/apache/logs/ssl_scache(512000)\"")), "{got}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stock_example_in_a_system_folder_stays() {
+        let conf = "<Directory \"C:/Program Files/Other/htdocs\">\nErrorLog \"C:/Program Files/Other/logs/error.log\"\n";
+        let base = extra_tree("stock", "httpd-example.conf", conf);
+        reanchor_extras(&base, &mut |_, _| {});
+        assert_eq!(
+            fs::read_to_string(base.join(r"apache\conf\extra\httpd-example.conf")).unwrap(),
+            conf
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

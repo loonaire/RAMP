@@ -48,8 +48,8 @@ type AppRc = Rc<RefCell<App>>;
 
 const MAX_LOG_LINES: usize = 500;
 
-// Delphi: cRunningColor=$C8FFC8, cPartialColor=clYellow, cStoppedColor=clBtnFace,
-// cErrorColor=clRed. Stopped is re-tuned for the dark theme.
+// Status pill colours: light green running, yellow partial, red error, and a
+// muted grey for stopped that suits the dark theme.
 const BG_RUNNING: (u8, u8, u8) = (200, 255, 200);
 const BG_PARTIAL: (u8, u8, u8) = (255, 213, 74);
 const BG_STOPPED: (u8, u8, u8) = (58, 63, 75);
@@ -82,7 +82,7 @@ struct Module {
     pids: Vec<u32>,
     running: bool,
     error: bool,
-    old_running: Option<bool>, // None == Delphi's oldIsRunningByte = 2 (unknown)
+    old_running: Option<bool>, // None: not observed yet
     old_pid_count: usize,
     phase: Phase,
     /// Clean MariaDB shutdown running on a thread: STOP_PENDING until it is done.
@@ -190,7 +190,7 @@ fn windows_version() -> String {
 }
 
 fn detect_basedir() -> PathBuf {
-    let dir = match std::env::var("XAMPP_BASEDIR") {
+    let dir = match std::env::var("RAMP_BASEDIR") {
         Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
         _ => std::env::current_exe()
             .ok()
@@ -1088,7 +1088,7 @@ fn run_system_upgrade(basedir: &Path, ports: &[u16], log: &mut dyn FnMut(String,
 }
 
 /// True when the fresh Apache error log shows the new OpenSSL refusing the
-/// current certificate (XAMPP ships a 1024-bit one, rejected since 3.5).
+/// current certificate (older packages ship a 1024-bit one, rejected since 3.5).
 fn apache_cert_rejected(basedir: &Path) -> bool {
     let p = basedir.join("apache\\logs\\error.log");
     match std::fs::read_to_string(&p) {
@@ -1121,7 +1121,7 @@ fn regenerate_server_cert(basedir: &Path, log: &mut dyn FnMut(String, bool)) -> 
     let _ = std::fs::remove_file(&crt);
     let pid = run_process(
         &format!(
-            "\"{}\" req -x509 -nodes -days 3650 -newkey rsa:2048 -config \"{}\" -keyout \"{}\" -out \"{}\" -subj \"/C=DE/O=XAMPP/CN=localhost\" -addext \"subjectAltName=DNS:localhost\"",
+            "\"{}\" req -x509 -nodes -days 3650 -newkey rsa:2048 -config \"{}\" -keyout \"{}\" -out \"{}\" -subj \"/O=RAMP/CN=localhost\" -addext \"subjectAltName=DNS:localhost\"",
             ossl.to_string_lossy(),
             cnf.to_string_lossy(),
             key.to_string_lossy(),
@@ -1260,7 +1260,7 @@ fn run_apply(
         Err(e) => {
             log(e.clone(), true);
             // Apache Lounge ships newer OpenSSL than the current tree; OpenSSL
-            // 3.5+ rejects XAMPP's ancient 1024-bit certificate outright. The
+            // 3.5+ rejects an old 1024-bit certificate outright. The
             // old files stay in the backup, so replace them and retry once.
             let mut started = false;
             if info.comp == update::Comp::Apache && apache_cert_rejected(basedir) {
@@ -1688,6 +1688,10 @@ fn sync_binary_name(app: &mut App, comp: update::Comp, exe: &str, ui: &Ui) {
     } else {
         app.cfg.apache_binary = exe.to_string();
     }
+    // The status timer looks for this name too: without it, the panel would
+    // start mariadbd.exe and keep searching for mysqld.exe (STOPPED while running)
+    // until the next launch.
+    app.modules[comp.modules()[0]].binary = exe.to_lowercase();
     let _ = config::save_ini(&app.ini_path, &app.cfg.to_ini());
     add_log(
         app,
@@ -1886,7 +1890,7 @@ fn upd_drain(app: &mut App, ui: &Ui) {
     }
 }
 
-/// About dialog: the panel's own version and the XAMPP tree it runs on.
+/// About dialog: the panel's own version.
 fn show_about_window(app: &AppRc, _ui: &Ui) {
     let existing = app.borrow().about_win.clone();
     let win = match existing {
@@ -2172,8 +2176,6 @@ fn log_unexpected_shutdown(app: &mut App, ui: &Ui, name: &str) {
         "improper privileges, a crash, or a shutdown by another method.".into(),
         "Press the Logs button to view error logs and check".into(),
         "the Windows Event Viewer for more clues".into(),
-        "If you need more help, copy and post this".into(),
-        "entire log window on the forums".into(),
     ];
     for l in lines {
         add_log(app, ui, name, &l, LogType::Error);
@@ -2210,7 +2212,7 @@ fn module_ports(app: &App, m: &Module) -> String {
         .join(", ")
 }
 
-/// Port of tApache/tMySQL.CheckPorts (services branch dropped).
+/// Before a start: report any other program that holds one of the module's ports.
 fn check_ports(app: &mut App, ui: &Ui, idx: usize) {
     if !app.cfg.check_ports {
         return;
@@ -2254,7 +2256,7 @@ fn check_ports(app: &mut App, ui: &Ui, idx: usize) {
                 app,
                 ui,
                 name,
-                &format!("XAMPP {name} is already running on port {port}"),
+                &format!("{name} from this installation is already running on port {port}"),
                 LogType::Info,
             );
         } else {
@@ -2485,7 +2487,7 @@ fn log_stop_outcome(app: &mut App, ui: &Ui, name: &str, outcome: u8) {
     }
 }
 
-/// Port of tApache/tMySQL.UpdateStatus (services branch dropped).
+/// Refresh a module's pids and running state, and log status changes.
 fn update_module(app: &mut App, ui: &Ui, idx: usize) {
     let finished = app.modules[idx]
         .stop_job
@@ -2497,7 +2499,16 @@ fn update_module(app: &mut App, ui: &Ui, idx: usize) {
         let name = app.modules[idx].name;
         log_stop_outcome(app, ui, name, outcome);
     }
-    let binary = app.modules[idx].binary.clone();
+    // Every daemon name the component ships counts, not only the configured
+    // one: MariaDB carries both mariadbd.exe and mysqld.exe, and a server
+    // started under the other name is running all the same.
+    let comp = if idx == 0 { update::Comp::Apache } else { update::Comp::Mysql };
+    let mut names: Vec<String> = comp
+        .exe_candidates()
+        .iter()
+        .map(|c| c.rsplit('/').next().unwrap_or(c).to_lowercase())
+        .collect();
+    names.push(app.modules[idx].binary.clone());
     let mut sorted: Vec<(u32, String)> = app
         .names
         .iter()
@@ -2506,7 +2517,7 @@ fn update_module(app: &mut App, ui: &Ui, idx: usize) {
     sorted.sort();
     let mut pids: Vec<u32> = Vec::new();
     for (pid, pname) in sorted {
-        if !pname.starts_with(&binary) {
+        if !names.contains(&pname) {
             continue;
         }
         if procs::pid_in_tree(&app.basedir, pid) {
@@ -2658,8 +2669,8 @@ fn file_rows(app: &App, kind: &str, idx: usize) -> Vec<(String, String, bool)> {
                 false,
             ),
             (
-                "Apache (httpd-xampp.conf)",
-                "apache\\conf\\extra\\httpd-xampp.conf",
+                "Apache (httpd-ramp.conf)",
+                update::PHP_CONF,
                 false,
             ),
             ("PHP (php.ini)", "php\\php.ini", false),
@@ -3016,24 +3027,12 @@ fn do_quit(app: &mut App, ui: &Ui) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let basedir = detect_basedir();
-    // XAMPP_BASEDIR may name a folder that does not exist yet (`cargo run`
+    // RAMP_BASEDIR may name a folder that does not exist yet (`cargo run`
     // points it at ../ramp-dev): ramp.ini and ramp.log go there from the start.
     let _ = std::fs::create_dir_all(&basedir);
     let stem = exe_stem();
     let ini_path = basedir.join(format!("{stem}.ini"));
     let log_path = basedir.join(format!("{stem}.log"));
-    // The project was named xampp-rs before becoming RAMP: carry the old
-    // per-exe config and log over when running under the new binary name.
-    if stem != "xampp-rs" {
-        let legacy_ini = basedir.join("xampp-rs.ini");
-        if !ini_path.exists() && legacy_ini.exists() {
-            let _ = std::fs::rename(&legacy_ini, &ini_path);
-        }
-        let legacy_log = basedir.join("xampp-rs.log");
-        if !log_path.exists() && legacy_log.exists() {
-            let _ = std::fs::rename(&legacy_log, &log_path);
-        }
-    }
     let mut cfg = config::Config::load(&ini_path);
     let port_sync = sync_ports_from_conf(&basedir, &mut cfg);
     if !port_sync.is_empty() {
@@ -3139,7 +3138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
     }
 
-    // Startup log, mirrors TfMain.FormCreate.
+    // Startup log.
     {
         let mut a = app.borrow_mut();
         add_log(
@@ -3195,7 +3194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut a,
             &ui,
             "main",
-            &format!("XAMPP Installation Directory: \"{bd}\""),
+            &format!("Installation Directory: \"{bd}\""),
             LogType::Default,
         );
         if in_cargo_target(&basedir) {

@@ -195,8 +195,8 @@ fn my_ini_port(path: &Path) -> Option<u16> {
     first
 }
 
-/// `$cfg['Servers'][$i]['port'] = '3306';`. XAMPP's config.inc.php has no such
-/// line (3306 is phpMyAdmin's default): one is added under the host line.
+/// `$cfg['Servers'][$i]['port'] = '3306';`. A config.inc.php without that line
+/// relies on phpMyAdmin's 3306 default: one is added under the host line.
 fn set_pma_port(path: &Path, port: u16) -> Result<usize, String> {
     let live = |l: &str| {
         let t = l.trim_start();
@@ -340,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn xampp_pma_config_gets_a_port_line() {
+    fn pma_config_without_port_gets_a_port_line() {
         let base = tree("pma");
         fs::write(base.join(MYINI), "[mysqld]\nport=3306\n").unwrap();
         fs::write(base.join(PMA), "<?php\n    $cfg['Servers'][$i]['host'] = '127.0.0.1';\n").unwrap();

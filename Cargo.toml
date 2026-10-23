@@ -2,7 +2,7 @@
 name = "ramp"
 version = "0.3.0"
 edition = "2021"
-description = "RAMP Control Panel: modern Rust + Slint rewrite of the XAMPP Control Panel (Apache + MySQL only, no Windows services)"
+description = "RAMP Control Panel: Apache, MariaDB, PHP and phpMyAdmin on Windows, in Rust + Slint (no Windows services)"
 
 [dependencies]
 serde_json = "1.0.154"
@@ -23,3 +23,9 @@ lto = true
 
 [profile.dev]
 debug = 0
+
+# Dependencies optimised in debug builds too: the unoptimised software renderer
+# takes 300-500 ms to paint a window, a black window at every opening under
+# `cargo run`. RAMP's own code stays unoptimised.
+[profile.dev.package."*"]
+opt-level = 2
