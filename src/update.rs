@@ -223,6 +223,7 @@ pub struct Info {
 }
 
 const PHP_JSON: &str = "https://windows.php.net/downloads/releases/releases.json";
+const PHP_STATES: &str = "https://www.php.net/releases/states.php";
 const PHP_BASE: &str = "https://windows.php.net/downloads/releases";
 const AL_PAGE: &str = "https://www.apachelounge.com/download/VS17/";
 const AL_BASE: &str = "https://www.apachelounge.com/download/VS17/binaries";
@@ -252,11 +253,68 @@ pub fn installed_opt(basedir: &Path, comp: Comp) -> Option<Ver> {
     installed_version(basedir, comp).ok()
 }
 
+/// Support state of one PHP branch, as php.net publishes it.
+struct PhpBranch {
+    /// "stable" (active support), "security" (security fixes only) or "eol".
+    state: String,
+    active_end: String,
+    security_end: String,
+}
+
+/// php.net's releases/states.php: `{"8": {"8.4": {"state": "stable",
+/// "active_support_end": "2026-12-31T00:00:00+00:00", ...}}}`, keyed "8.4".
+fn parse_php_states(txt: &str) -> Result<std::collections::HashMap<String, PhpBranch>, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(txt).map_err(|e| format!("php.net states: {e}"))?;
+    let majors = val.as_object().ok_or("unexpected php.net states JSON")?;
+    let date = |b: &serde_json::Value, k: &str| -> String {
+        b.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| s.chars().take(10).collect())
+            .unwrap_or_default()
+    };
+    let mut out = std::collections::HashMap::new();
+    for branches in majors.values().filter_map(|m| m.as_object()) {
+        for (line, b) in branches {
+            out.insert(
+                line.clone(),
+                PhpBranch {
+                    state: b.get("state").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    active_end: date(b, "active_support_end"),
+                    security_end: date(b, "security_support_end"),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Dropdown status and note for a PHP branch.
+fn php_branch_label(b: &PhpBranch) -> (String, String) {
+    match b.state.as_str() {
+        "stable" => (
+            "Active".into(),
+            // Kept short: it has to fit beside the install window's dropdown.
+            format!("active until {}, security until {}", b.active_end, b.security_end),
+        ),
+        "security" => (
+            "Security".into(),
+            format!("security fixes only, until {}", b.security_end),
+        ),
+        "eol" => ("EOL".into(), format!("end of life since {}", b.security_end)),
+        _ => (String::new(), String::new()),
+    }
+}
+
 /// `cur` = installed version; `None` means the component is not installed at all
-/// (first-run bootstrap): every published build is then a candidate and the
-/// newest one is the pick.
+/// (first-run bootstrap): every branch php.net still supports is then a
+/// candidate, newest first. Each candidate carries its support state.
 pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, String> {
     let shown = cur.map(|c| c.show()).unwrap_or_else(|| "not installed".into());
+    // Without php.net's states the list is still usable, just unlabelled.
+    let states = http::http_get_text(PHP_STATES)
+        .and_then(|t| parse_php_states(&t))
+        .unwrap_or_default();
     let txt = http::http_get_text(PHP_JSON)?;
     let val: serde_json::Value =
         serde_json::from_str(&txt).map_err(|e| format!("releases.json PHP: {e}"))?;
@@ -305,6 +363,13 @@ pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, Strin
             .and_then(|x| x.as_str())
             .map(human_size)
             .unwrap_or(0);
+        let line = format!("{}.{}", v.0[0], v.0[1]);
+        let branch = states.get(&line);
+        // A fresh install only offers branches that still get fixes.
+        if cur.is_none() && branch.is_some_and(|b| b.state == "eol") {
+            continue;
+        }
+        let (status, note) = branch.map(php_branch_label).unwrap_or_default();
         out.push((
             v,
             Info {
@@ -315,9 +380,9 @@ pub fn feed_php(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, Strin
                 file: path.to_string(),
                 sha256: sha,
                 size,
-                note: String::new(),
-                line: String::new(),
-                status: String::new(),
+                note,
+                line,
+                status,
             },
         ));
     }
@@ -351,6 +416,9 @@ pub fn feed_apache(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, St
                 sha = h;
             }
         }
+        let note = apachelounge_build_date(&name)
+            .map(|d| format!("Apache Lounge build of {d}"))
+            .unwrap_or_default();
         out.push(Info {
             comp: Comp::Apache,
             installed: shown.clone(),
@@ -359,12 +427,19 @@ pub fn feed_apache(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>, St
             file: name,
             sha256: sha,
             size: 0,
-            note: String::new(),
-            line: String::new(),
+            note,
+            line: format!("{}.{}", v.0[0], v.0[1]),
             status: String::new(),
         });
     }
     Ok(out)
+}
+
+/// `httpd-2.4.66-251206-win64-VS17.zip` -> "2025-12-06".
+fn apachelounge_build_date(name: &str) -> Option<String> {
+    let d = name.split('-').nth(2)?;
+    (d.len() == 6 && d.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("20{}-{}-{}", &d[..2], &d[2..4], &d[4..]))
 }
 
 /// Scan an HTML page for `httpd-X.Y.Z-YYMMDD-Win64-VS17.zip` names.
@@ -528,6 +603,7 @@ pub fn feed_mariadb(
         .map(|c| format!("{}.{}", c.0[0], c.0[1]))
         .unwrap_or_default();
     let target = target_line.trim();
+    let today = today_str();
     let wanted: Vec<&Line> = if !target.is_empty() {
         lines.iter().filter(|l| l.id == target).collect()
     } else if let Some(c) = cur {
@@ -540,8 +616,12 @@ pub fn feed_mariadb(
             })
             .collect()
     } else {
-        // Fresh install: pin it on an LTS line, never on a rolling or preview one.
-        let lts: Vec<&Line> = lines.iter().filter(|l| l.status == "LTS").collect();
+        // Fresh install: pin it on an LTS line, never on a rolling or preview one,
+        // nor on one past its end of life (the API keeps listing those).
+        let lts: Vec<&Line> = lines
+            .iter()
+            .filter(|l| l.status == "LTS" && !eol_passed(&l.eol, &today))
+            .collect();
         if lts.is_empty() {
             lines.iter().collect()
         } else {
@@ -559,7 +639,6 @@ pub fn feed_mariadb(
             seen.join(", ")
         ));
     }
-    let today = today_str();
     let mut out: Vec<(Ver, Info)> = Vec::new();
     for line in wanted {
         let t = match http::http_get_text(&format!("{MDB_API}/{}/latest/", line.id)) {
@@ -619,13 +698,15 @@ pub fn feed_mariadb(
         if let Some((rv, name, url, sha, size)) = best {
             let mut note = String::new();
             if !line.eol.is_empty() {
-                let passed = line.eol.as_str() <= today.as_str();
                 note = format!(
                     "line {} EOL {}{}",
                     line.id,
                     line.eol,
-                    if passed { " (passed)" } else { "" }
+                    if eol_passed(&line.eol, &today) { " (passed)" } else { "" }
                 );
+            } else if line.status == "Rolling" {
+                // Leaving an LTS line for this one trades years of fixes for months.
+                note = "rolling release: supported until the next one ships".into();
             }
             out.push((
                 rv,
@@ -697,6 +778,11 @@ pub fn feed_phpmyadmin(cur: Option<&Ver>, allow_major: bool) -> Result<Vec<Info>
         }
     }
     cands.sort_by(|a, b| ver_cmp(b, a));
+    // A fresh install only ever takes the newest release: skip fetching dozens
+    // of checksum sidecars for the others.
+    if cur.is_none() {
+        cands.truncate(1);
+    }
     let mut out = Vec::new();
     for v in cands {
         let ver = v.show();
@@ -742,6 +828,11 @@ pub fn target_label(i: &Info) -> String {
     }
 }
 
+/// Both dates as YYYY-MM-DD, so they compare as text; no date means not passed.
+fn eol_passed(eol: &str, today: &str) -> bool {
+    !eol.is_empty() && eol <= today
+}
+
 fn today_str() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -761,6 +852,32 @@ fn today_str() -> String {
     format!("{:04}-{:02}-{:02}", if y <= 0 { y + 1 } else { y }, m, d)
 }
 
+/// What a fresh install can choose from, newest first: Apache Lounge's 2.4
+/// builds, MariaDB's long-term support lines (or the pinned TargetLine), the
+/// PHP branches php.net still supports, and the newest phpMyAdmin. An empty
+/// list is reported as an error, so the row can say why it has no choice.
+pub fn install_choices(target_line: &str) -> Vec<(Comp, Result<Vec<Info>, String>)> {
+    Comp::all()
+        .into_iter()
+        .map(|c| {
+            let list = match c {
+                Comp::Apache => feed_apache(None, true),
+                Comp::Mysql => feed_mariadb(None, true, target_line),
+                Comp::Php => feed_php(None, true),
+                Comp::Phpmyadmin => feed_phpmyadmin(None, true),
+            };
+            let list = list.and_then(|l| {
+                if l.is_empty() {
+                    Err(format!("no published {} build found", c.label()))
+                } else {
+                    Ok(l)
+                }
+            });
+            (c, list)
+        })
+        .collect()
+}
+
 /// One entry per component, tagged with the component so a feed error can still
 /// be attributed to a row in the update window.
 pub fn check_all(
@@ -768,7 +885,7 @@ pub fn check_all(
     allow_major: bool,
     target_line: &str,
 ) -> Vec<(Comp, Result<Vec<Info>, String>)> {
-    Comp::all()
+    let mut res: Vec<(Comp, Result<Vec<Info>, String>)> = Comp::all()
         .into_iter()
         .map(|c| {
             let r = match installed_opt(basedir, c) {
@@ -782,7 +899,28 @@ pub fn check_all(
             };
             (c, r)
         })
-        .collect()
+        .collect();
+    fill_sizes(&mut res);
+    res
+}
+
+/// Archive sizes the feeds do not publish (MariaDB's API, Apache Lounge,
+/// phpMyAdmin): asked from the download servers, all at once, for display.
+fn fill_sizes(res: &mut [(Comp, Result<Vec<Info>, String>)]) {
+    std::thread::scope(|s| {
+        for info in res
+            .iter_mut()
+            .filter_map(|(_, r)| r.as_mut().ok())
+            .flatten()
+            .filter(|i| i.size == 0 && !i.url.is_empty())
+        {
+            s.spawn(move || {
+                if let Some(n) = http::http_size(&info.url) {
+                    info.size = n;
+                }
+            });
+        }
+    });
 }
 
 // ------------------------------------------------------------------ checksum
@@ -1852,6 +1990,42 @@ mod tests {
     }
 
     const PHP: &str = "LoadModule php_module \"c:/x/php/php8apache2_4.dll\"\n";
+
+    #[test]
+    fn php_states_label_the_branches() {
+        let json = r#"{"8":{"8.5":{"state":"stable","initial_release":"2025-11-20T00:00:00+00:00","active_support_end":"2027-12-31T00:00:00+00:00","security_support_end":"2029-12-31T00:00:00+00:00"},
+            "8.2":{"state":"security","active_support_end":"2024-12-31T00:00:00+00:00","security_support_end":"2026-12-31T00:00:00+00:00"},
+            "8.1":{"state":"eol","active_support_end":"2023-11-25T00:00:00+00:00","security_support_end":"2025-12-31T00:00:00+00:00"}},
+            "7":{"7.4":{"state":"eol","security_support_end":"2022-11-28T00:00:00+00:00"}}}"#;
+        let s = parse_php_states(json).unwrap();
+        assert_eq!(s.len(), 4);
+        assert_eq!(
+            php_branch_label(&s["8.5"]),
+            ("Active".into(), "active until 2027-12-31, security until 2029-12-31".into())
+        );
+        assert_eq!(
+            php_branch_label(&s["8.2"]),
+            ("Security".into(), "security fixes only, until 2026-12-31".into())
+        );
+        assert_eq!(php_branch_label(&s["8.1"]).0, "EOL");
+    }
+
+    #[test]
+    fn mariadb_eol_dates_compare_as_text() {
+        assert!(eol_passed("2026-07-06", "2026-11-07"));
+        assert!(eol_passed("2026-11-07", "2026-11-07"));
+        assert!(!eol_passed("2028-02-16", "2026-11-07"));
+        assert!(!eol_passed("", "2026-11-07"));
+    }
+
+    #[test]
+    fn apache_lounge_build_dates() {
+        assert_eq!(
+            apachelounge_build_date("httpd-2.4.66-251206-win64-VS17.zip").as_deref(),
+            Some("2025-12-06")
+        );
+        assert_eq!(apachelounge_build_date("httpd-2.4.66-win64-VS17.zip"), None);
+    }
 
     #[test]
     fn the_file_that_loads_php_is_adopted() {

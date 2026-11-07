@@ -11,6 +11,7 @@ mod ports;
 mod procs;
 mod update;
 
+use slint::winit_030::{winit::event::WindowEvent as WinitEvent, EventResult, WinitWindowAccessor};
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
@@ -115,6 +116,11 @@ struct App {
     upd_comps: Vec<update::Comp>,
     upd_rx: Option<std::sync::mpsc::Receiver<UpdMsg>>,
     upd_busy: bool,
+    install_win: Option<Rc<InstallWindow>>,
+    install_model: Rc<VecModel<InstallRow>>,
+    /// Per install-window row: the component and the builds it can pick from.
+    install_choices: Vec<(update::Comp, Vec<update::Info>)>,
+    install_sel: Vec<usize>,
     /// The worker is moving component trees (apply, restore, first-run install):
     /// exiting now would leave apache/ or mysql/ half moved, so quitting waits.
     upd_writes: bool,
@@ -399,6 +405,7 @@ const TITLE_SETTINGS: &str = "Settings";
 const TITLE_UPDATES: &str = "Component Updates";
 const TITLE_ABOUT: &str = "About RAMP Control Panel";
 const TITLE_DEPS: &str = "Missing libraries";
+const TITLE_INSTALL: &str = "Install RAMP";
 
 /// The one page Microsoft keeps current for the x64 VC++ runtime.
 const VC_REDIST_X64: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
@@ -410,8 +417,82 @@ const TITLE_FILES: &str = "RAMP Files";
 /// title.
 fn show_and_anchor<W: ComponentHandle>(win: &Rc<W>, title: &str) {
     pre_center(win, title);
+    repaint_after_minimize(win.window(), || {});
     let _ = win.window().show();
     anchor_by_title(title.to_string(), 10);
+}
+
+/// Black window after a restore from the taskbar (Slint 1.18, software
+/// renderer, Windows). Minimizing reports a 0x0 size and Slint drops its
+/// partial-render cache, as it should: Windows discards the window's image.
+/// But a frame drawn while minimized (a log line, a status change) refills
+/// that cache, so on restore Slint believes the screen is current, presents
+/// nothing, and the window stays black until something else changes.
+/// Skipping the frames of a minimized window keeps the cache empty, and the
+/// first frame after the restore repaints the whole window. `on_restore` runs
+/// once the window is back.
+fn repaint_after_minimize(win: &slint::Window, on_restore: impl Fn() + 'static) {
+    let minimized = std::cell::Cell::new(win.is_minimized());
+    win.on_winit_window_event(move |w, ev| match ev {
+        WinitEvent::Resized(size) => {
+            let now = size.width == 0 || size.height == 0;
+            if minimized.replace(now) && !now {
+                // Restored: a frame must follow even if Windows sends no paint,
+                // since the skipped ones left Slint's redraw request pending.
+                let _ = w.with_winit_window(|ww| ww.request_redraw());
+                on_restore();
+            }
+            EventResult::Propagate
+        }
+        WinitEvent::RedrawRequested if minimized.get() => EventResult::PreventDefault,
+        _ => EventResult::Propagate,
+    });
+}
+
+/// The open sub-windows, after the panel comes back from the taskbar. Windows
+/// hides owned windows together with their owner and shows them again on
+/// restore, all behind Slint's back: Slint keeps its cache, nothing in the
+/// sub-window changed, so it paints nothing and the window comes back blank.
+/// Slint's own show() marks the whole window for repainting, precisely because
+/// Windows discards the image of a window that is not shown, so each open
+/// sub-window goes through hide() + show() (one message loop turn, no flicker;
+/// the HWND, its anchoring hook and its position stay as they are).
+fn repaint_sub_windows(app: &AppRc) {
+    let (file, settings, upd, about, dep, install) = {
+        let Ok(a) = app.try_borrow() else { return };
+        (
+            a.file_win.clone(),
+            a.settings_win.clone(),
+            a.upd_win.clone(),
+            a.about_win.clone(),
+            a.dep_win.clone(),
+            a.install_win.clone(),
+        )
+    };
+    let again = |w: &slint::Window| {
+        if w.is_visible() {
+            let _ = w.hide();
+            let _ = w.show();
+        }
+    };
+    if let Some(w) = file {
+        again(w.window());
+    }
+    if let Some(w) = settings {
+        again(w.window());
+    }
+    if let Some(w) = upd {
+        again(w.window());
+    }
+    if let Some(w) = about {
+        again(w.window());
+    }
+    if let Some(w) = dep {
+        again(w.window());
+    }
+    if let Some(w) = install {
+        again(w.window());
+    }
 }
 
 fn find_win_by_title(title: &str, skip: &[isize]) -> Option<isize> {
@@ -527,10 +608,11 @@ fn declared_size(title: &str) -> Option<(i32, i32)> {
     match title {
         TITLE_MAIN => Some((690, 460)),
         TITLE_SETTINGS => Some((480, 464)),
-        TITLE_UPDATES => Some((680, 430)),
+        TITLE_UPDATES => Some((820, 430)),
         TITLE_FILES => Some((520, 380)),
         TITLE_ABOUT => Some((340, 230)),
         TITLE_DEPS => Some((480, 220)),
+        TITLE_INSTALL => Some((620, 340)),
         _ => None,
     }
 }
@@ -915,6 +997,8 @@ enum UpdMsg {
     Restored(update::Comp, Result<String, String>),
     /// First-run bootstrap: the server binaries the install ended up with.
     BootDone(Result<(String, String), String>),
+    /// What a fresh install can pick from, for the install window.
+    Choices(Vec<(update::Comp, Result<Vec<update::Info>, String>)>),
 }
 
 /// PHP has no daemon of its own: prove a swapped-in build really runs by
@@ -1424,7 +1508,7 @@ fn upd_check(app: &AppRc, _ui: &Ui) {
 /// thing to do. The worker talks through the updater's queue, so the log panel
 /// follows along and the panel stays usable.
 fn start_first_run(app: &AppRc, _ui: &Ui) {
-    let (bd, o) = {
+    let fresh = {
         let mut a = app.borrow_mut();
         if a.upd_busy {
             return;
@@ -1467,13 +1551,31 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
             );
             return;
         }
-        let o = install::Opts {
-            apache_port: a.cfg.apache_port,
-            mysql_port: a.cfg.mysql_port,
-            target_line: a.cfg.upd_target_line.clone(),
-            verify: !repair,
-        };
-        (a.basedir.clone(), o)
+        !miss.is_empty()
+    };
+    if fresh {
+        // A fresh package: the user picks the versions before anything downloads.
+        show_install_window(app, _ui);
+    } else {
+        begin_bootstrap(app, _ui, Vec::new(), false);
+    }
+}
+
+/// Install (fresh) or repair (moved package) on a worker thread. `picks` are the
+/// builds chosen in the install window; the log panel follows along.
+fn begin_bootstrap(app: &AppRc, ui: &Ui, picks: Vec<update::Info>, fresh: bool) {
+    let (bd, o) = {
+        let a = app.borrow();
+        (
+            a.basedir.clone(),
+            install::Opts {
+                apache_port: a.cfg.apache_port,
+                mysql_port: a.cfg.mysql_port,
+                target_line: a.cfg.upd_target_line.clone(),
+                verify: fresh,
+                picks,
+            },
+        )
     };
     let (tx, rx) = std::sync::mpsc::channel();
     {
@@ -1486,13 +1588,21 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
         w.set_busy(true);
         w.set_status("Installing the components...".into());
     }
-    add_log(
-        &mut app.borrow_mut(),
-        _ui,
-        "update",
-        "First run: downloading and installing MariaDB, PHP, Apache and phpMyAdmin. This takes a few minutes...",
-        LogType::Info,
-    );
+    if fresh {
+        let chosen = o
+            .picks
+            .iter()
+            .map(|i| format!("{} {}", i.comp.label(), i.available))
+            .collect::<Vec<_>>()
+            .join(", ");
+        add_log(
+            &mut app.borrow_mut(),
+            ui,
+            "update",
+            &format!("First run: downloading and installing {chosen}. This takes a few minutes..."),
+            LogType::Info,
+        );
+    }
     std::thread::spawn(move || {
         let mut lg = |line: String, warn: bool| {
             let _ = tx.send(UpdMsg::Log(line, warn));
@@ -1502,6 +1612,135 @@ fn start_first_run(app: &AppRc, _ui: &Ui) {
             .map(|b| (b.apache_exe, b.mysql_exe));
         let _ = tx.send(UpdMsg::BootDone(r));
     });
+}
+
+/// Open (or re-show) the install window: one row per component, filled by
+/// fetch_install_choices().
+fn open_install_window(app: &AppRc, ui: &Ui) -> Option<Rc<InstallWindow>> {
+    let existing = app.borrow().install_win.clone();
+    let win = match existing {
+        Some(w) => w,
+        None => {
+            let w = Rc::new(InstallWindow::new().ok()?);
+            w.set_rows(ModelRc::from(app.borrow().install_model.clone()));
+            let app_cb = app.clone();
+            w.on_set_choice(move |row, sel| install_select(&app_cb, row as usize, sel));
+            let app_cb = app.clone();
+            let ui_cb = ui.clone();
+            w.on_action(move || install_action(&app_cb, &ui_cb));
+            let app_cb = app.clone();
+            let ui_cb = ui.clone();
+            let wc = Rc::downgrade(&w);
+            w.on_later(move || {
+                if let Some(w) = wc.upgrade() {
+                    let _ = w.hide();
+                }
+                install_postponed(&app_cb, &ui_cb);
+            });
+            let app_cb = app.clone();
+            let ui_cb = ui.clone();
+            w.window().on_close_requested(move || {
+                install_postponed(&app_cb, &ui_cb);
+                CloseRequestResponse::HideWindow
+            });
+            app.borrow_mut().install_win = Some(w.clone());
+            w
+        }
+    };
+    show_and_anchor(&win, TITLE_INSTALL);
+    Some(win)
+}
+
+fn show_install_window(app: &AppRc, ui: &Ui) {
+    if let Some(w) = open_install_window(app, ui) {
+        fetch_install_choices(app, &w);
+    }
+}
+
+/// Ask the feeds what a fresh install can pick from, on a worker thread;
+/// upd_drain() fills the rows.
+fn fetch_install_choices(app: &AppRc, win: &InstallWindow) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let line = {
+        let mut a = app.borrow_mut();
+        if a.upd_busy {
+            return;
+        }
+        a.upd_busy = true;
+        a.upd_rx = Some(rx);
+        a.cfg.upd_target_line.clone()
+    };
+    win.set_busy(true);
+    win.set_ready(false);
+    win.set_action_text("Install".into());
+    win.set_status("Fetching the supported versions...".into());
+    std::thread::spawn(move || {
+        let _ = tx.send(UpdMsg::Choices(update::install_choices(&line)));
+    });
+}
+
+fn install_row(comp: update::Comp, list: &[update::Info], sel: usize, error: &str) -> InstallRow {
+    InstallRow {
+        name: comp.label().into(),
+        choices: ModelRc::from(Rc::new(VecModel::from(
+            list.iter()
+                .map(|i| SharedString::from(update::target_label(i)))
+                .collect::<Vec<SharedString>>(),
+        ))),
+        sel: sel as i32,
+        note: list.get(sel).map(|i| i.note.clone()).unwrap_or_default().into(),
+        error: error.into(),
+    }
+}
+
+/// A different version was picked: remember it, and let the note follow.
+fn install_select(app: &AppRc, row: usize, sel: i32) {
+    let Ok(sel) = usize::try_from(sel) else { return };
+    let mut a = app.borrow_mut();
+    let Some((comp, list)) = a.install_choices.get(row).cloned() else {
+        return;
+    };
+    if sel >= list.len() {
+        return;
+    }
+    a.install_sel[row] = sel;
+    a.install_model.set_row_data(row, install_row(comp, &list, sel, ""));
+}
+
+/// The window's main button: Install once every component has a version,
+/// Retry when a feed could not be reached.
+fn install_action(app: &AppRc, ui: &Ui) {
+    let picks: Option<Vec<update::Info>> = {
+        let a = app.borrow();
+        if a.upd_busy {
+            return;
+        }
+        a.install_choices
+            .iter()
+            .zip(&a.install_sel)
+            .map(|((_, list), sel)| list.get(*sel).cloned())
+            .collect()
+    };
+    let Some(win) = app.borrow().install_win.clone() else {
+        return;
+    };
+    match picks {
+        Some(p) if !p.is_empty() => {
+            let _ = win.hide();
+            begin_bootstrap(app, ui, p, true);
+        }
+        _ => fetch_install_choices(app, &win),
+    }
+}
+
+fn install_postponed(app: &AppRc, ui: &Ui) {
+    add_log(
+        &mut app.borrow_mut(),
+        ui,
+        "update",
+        "installation postponed: restart RAMP to choose the versions again, or run ramp --first-run",
+        LogType::Info,
+    );
 }
 
 /// Apply one row of the update window on a worker thread.
@@ -1574,9 +1813,11 @@ fn upd_row(
                 .collect::<Vec<SharedString>>(),
         ))),
         sel: sel as i32,
+        // Nothing to download when up to date; a dash when the server kept quiet.
         size: match cur {
             Some(i) if i.size > 0 => format!("{} MB", i.size.div_ceil(1_048_576)).into(),
-            _ => "?".into(),
+            Some(_) => "\u{2014}".into(),
+            None => SharedString::default(),
         },
         note: cur.map(|i| i.note.clone()).unwrap_or_default().into(),
         updatable: !list.is_empty(),
@@ -1879,6 +2120,43 @@ fn upd_drain(app: &mut App, ui: &Ui) {
                     w.set_status("Done.".into());
                 }
             }
+            UpdMsg::Choices(res) => {
+                pending = false;
+                app.upd_busy = false;
+                app.install_choices.clear();
+                app.install_sel.clear();
+                app.install_model.clear();
+                let mut unreachable: Vec<&str> = Vec::new();
+                for (comp, r) in res {
+                    let (list, err) = match r {
+                        Ok(list) => (list, String::new()),
+                        Err(e) => {
+                            unreachable.push(comp.label());
+                            (Vec::new(), e)
+                        }
+                    };
+                    app.install_model.push(install_row(comp, &list, 0, &err));
+                    app.install_choices.push((comp, list));
+                    app.install_sel.push(0);
+                }
+                if let Some(w) = app.install_win.clone() {
+                    w.set_busy(false);
+                    w.set_ready(unreachable.is_empty());
+                    if unreachable.is_empty() {
+                        w.set_action_text("Install".into());
+                        w.set_status("Newest supported releases preselected.".into());
+                    } else {
+                        w.set_action_text("Retry".into());
+                        w.set_status(
+                            format!(
+                                "{} unreachable: check the connection, then Retry.",
+                                unreachable.join(", ")
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
         }
     }
     ui.main.set_update_busy(app.upd_busy);
@@ -1909,6 +2187,8 @@ fn show_about_window(app: &AppRc, _ui: &Ui) {
         }
     };
     win.set_app_version(format!("Version RAMP v{}", env!("CARGO_PKG_VERSION")).into());
+    // Release builds compile debug assertions out; debug ones (cargo run) keep them.
+    win.set_build_type(if cfg!(debug_assertions) { "debug build" } else { "release build" }.into());
     show_and_anchor(&win, TITLE_ABOUT);
 }
 
@@ -3090,11 +3370,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         upd_comps: Vec::new(),
         upd_rx: None,
         upd_busy: false,
+        install_win: None,
+        install_model: Rc::new(VecModel::default()),
+        install_choices: Vec::new(),
+        install_sel: Vec::new(),
         upd_writes: false,
         closing: false,
     }));
 
     let main_window = Rc::new(MainWindow::new()?);
+    let app_r = app.clone();
+    repaint_after_minimize(main_window.window(), move || {
+        // Next loop turn: not from inside the main window's event dispatch.
+        let app_r = app_r.clone();
+        Timer::single_shot(std::time::Duration::ZERO, move || repaint_sub_windows(&app_r));
+    });
     let mod_model = Rc::new(VecModel::from(
         app.borrow()
             .modules
@@ -3492,8 +3782,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Headless first-run install: ramp --first-run [--no-verify]
+    //   [--apache <version>] [--mariadb <line|version>] [--php <line|version>]
     if args.iter().any(|a| a == "--first-run") {
         let verify = !args.iter().any(|a| a == "--no-verify");
+        let wanted: Vec<(update::Comp, String)> = [
+            ("--apache", update::Comp::Apache),
+            ("--mariadb", update::Comp::Mysql),
+            ("--php", update::Comp::Php),
+        ]
+        .into_iter()
+        .filter_map(|(flag, comp)| {
+            let pos = args.iter().position(|a| a == flag)?;
+            Some((comp, args.get(pos + 1)?.to_ascii_lowercase()))
+        })
+        .collect();
         let app_t = app.clone();
         let ui_t = ui.clone();
         Timer::single_shot(std::time::Duration::from_millis(900), move || {
@@ -3511,6 +3813,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 do_quit(&mut a, &ui_t);
                 return;
             }
+            let mut picks = Vec::new();
+            if !wanted.is_empty() {
+                let line = app_t.borrow().cfg.upd_target_line.clone();
+                let choices = update::install_choices(&line);
+                for (comp, want) in &wanted {
+                    let list = choices
+                        .iter()
+                        .find(|(c, _)| c == comp)
+                        .and_then(|(_, r)| r.as_ref().ok())
+                        .cloned()
+                        .unwrap_or_default();
+                    let hit = list.iter().find(|i| {
+                        i.available.eq_ignore_ascii_case(want)
+                            || i.available.starts_with(&format!("{want}."))
+                            || i.line.eq_ignore_ascii_case(want)
+                    });
+                    match hit {
+                        Some(i) => picks.push(i.clone()),
+                        None => {
+                            let avail = list
+                                .iter()
+                                .map(update::target_label)
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let mut a = app_t.borrow_mut();
+                            add_log(
+                                &mut a,
+                                &ui_t,
+                                "update",
+                                &format!(
+                                    "CLI: no supported {} matches '{want}' (available: {avail})",
+                                    comp.label()
+                                ),
+                                LogType::Error,
+                            );
+                            do_quit(&mut a, &ui_t);
+                            return;
+                        }
+                    }
+                }
+            }
             let (bd, o) = {
                 let a = app_t.borrow();
                 (
@@ -3520,6 +3863,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mysql_port: a.cfg.mysql_port,
                         target_line: a.cfg.upd_target_line.clone(),
                         verify,
+                        picks,
                     },
                 )
             };
@@ -4010,6 +4354,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[("vcruntime140.dll".to_string(), "apache\\bin\\httpd.exe".to_string())],
             true,
         );
+        // Opened without fetching: the test checks placement, not the feeds.
+        let _ = open_install_window(&app_t, &ui_t);
             });
             let app_t = app.clone();
             let ui_t = ui.clone();
@@ -4031,6 +4377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TITLE_ABOUT,
                 TITLE_FILES,
                 TITLE_DEPS,
+                TITLE_INSTALL,
             ];
             let mut ok = 0usize;
             let mut rects: Vec<(&'static str, RECT)> = Vec::new();
@@ -4143,7 +4490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut a,
                     &ui_t,
                     "main",
-                    "TEST PASS: all 5 windows centered on work area",
+                    &format!("TEST PASS: all {} windows centered on work area", rects.len() + 1),
                     LogType::Info,
                 );
             } else {

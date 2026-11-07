@@ -71,7 +71,7 @@ fn split(url: &str) -> Result<(u16, String, String, bool), String> {
 }
 
 /// `redirects` is a WINHTTP_OPTION_REDIRECT_POLICY_* value.
-fn open_request(url: &str, redirects: u32) -> Result<Conn, String> {
+fn open_request(url: &str, verb: &str, redirects: u32) -> Result<Conn, String> {
     let (port, host, path, secure) = split(url)?;
     let agent = widez(UA);
     let session = unsafe {
@@ -108,9 +108,10 @@ fn open_request(url: &str, redirects: u32) -> Result<Conn, String> {
         }
         guard.conn = server;
         let pathw = widez(&path);
+        let verbw = widez(verb);
         let req = WinHttpOpenRequest(
             server,
-            PCWSTR(widez("GET").as_ptr()),
+            PCWSTR(verbw.as_ptr()),
             PCWSTR(pathw.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
@@ -173,7 +174,7 @@ fn content_length(req: *mut c_void) -> u64 {
 /// down to plain HTTP: feeds and checksums are what downloads are verified
 /// against, so they must stay on TLS end to end.
 pub fn http_get(url: &str) -> Result<Resp, String> {
-    let conn = open_request(url, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP)?;
+    let conn = open_request(url, "GET", WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP)?;
     unsafe {
         WinHttpSendRequest(conn.req, None, None, 0, 0, 0)
             .map_err(|e| format!("send to {}: {e}", redact(url)))?;
@@ -218,7 +219,7 @@ pub fn http_download(
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64, String> {
-    let conn = open_request(url, WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS)?;
+    let conn = open_request(url, "GET", WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS)?;
     unsafe {
         WinHttpSendRequest(conn.req, None, None, 0, 0, 0)
             .map_err(|e| format!("send to {}: {e}", redact(url)))?;
@@ -261,6 +262,22 @@ pub fn http_download(
         }
         progress(done, total.max(done));
         Ok(done)
+    }
+}
+
+/// Size of a download without fetching it: a HEAD request, Content-Length.
+/// Display only, so redirects are followed like a download's (MariaDB hands
+/// out mirrors), with short timeouts; None when the server does not say.
+pub fn http_size(url: &str) -> Option<u64> {
+    let conn = open_request(url, "HEAD", WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS).ok()?;
+    unsafe {
+        let _ = WinHttpSetTimeouts(conn.req, 5_000, 5_000, 5_000, 5_000);
+        WinHttpSendRequest(conn.req, None, None, 0, 0, 0).ok()?;
+        WinHttpReceiveResponse(conn.req, std::ptr::null_mut()).ok()?;
+        if status_of(conn.req).ok()? != 200 {
+            return None;
+        }
+        Some(content_length(conn.req)).filter(|n| *n > 0)
     }
 }
 

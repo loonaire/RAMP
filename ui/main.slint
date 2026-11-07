@@ -274,9 +274,20 @@ export struct UpdateInfo {
     error: string,
 }
 
+// Column widths shared by the header and every row, so the columns line up
+// whatever the texts are. Only DETAILS stretches (it wraps, then elides).
+global UpdCols {
+    out property <length> name: 92px;
+    out property <length> installed: 72px;
+    out property <length> target: 196px;
+    out property <length> size: 56px;
+    out property <length> button: 74px;
+    out property <length> gap: 10px;
+}
+
 export component UpdateWindow inherits Window {
     title: "Component Updates";
-    width: 680px;
+    width: 820px;
     height: 430px;
     icon: @image-url("../assets/logo.png");
 
@@ -308,78 +319,133 @@ export component UpdateWindow inherits Window {
             VerticalLayout {
                 padding: 0px;
                 spacing: 0px;
-                Rectangle {
-                    height: 16px;
-                    HorizontalLayout {
-                        x: 10px; y: 0px;
-                        width: parent.width - 20px;
-                        spacing: 8px;
-                        Text { width: 70px; text: "COMPONENT"; color: #8a8f98; font-size: 10px; }
-                        Text { width: 62px; text: "INSTALLED"; color: #8a8f98; font-size: 10px; }
-                        Rectangle { horizontal-stretch: 2; Text { text: "TARGET VERSION"; color: #8a8f98; font-size: 10px; } }
-                        Text { width: 56px; text: "SIZE"; color: #8a8f98; font-size: 10px; }
-                        Rectangle { horizontal-stretch: 1; Text { text: "STATUS"; color: #8a8f98; font-size: 10px; } }
-                    }
+                HorizontalLayout {
+                    height: 28px;
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: UpdCols.gap;
+                    Text { width: UpdCols.name; text: "COMPONENT"; color: #8a8f98; font-size: 10px; vertical-alignment: center; }
+                    Text { width: UpdCols.installed; text: "INSTALLED"; color: #8a8f98; font-size: 10px; vertical-alignment: center; }
+                    Text { width: UpdCols.target; text: "TARGET VERSION"; color: #8a8f98; font-size: 10px; vertical-alignment: center; }
+                    Text { width: UpdCols.size; text: "SIZE"; color: #8a8f98; font-size: 10px; vertical-alignment: center; }
+                    Text { min-width: 0px; horizontal-stretch: 1; text: "DETAILS"; color: #8a8f98; font-size: 10px; vertical-alignment: center; }
+                    Rectangle { width: UpdCols.button * 2 + UpdCols.gap; }
                 }
+                Rectangle { height: 1px; background: #262932; }
                 ListView {
                     for r[idx] in rows: Rectangle {
-                        height: 42px;
+                        height: 46px;
+                        // Row separator, below every row but the last.
+                        Rectangle {
+                            visible: idx < root.rows.length - 1;
+                            x: 12px;
+                            y: parent.height - 1px;
+                            width: parent.width - 24px;
+                            height: 1px;
+                            background: #1f2229;
+                        }
                         HorizontalLayout {
-                            x: 10px; y: 8px;
-                            width: parent.width - 20px;
-                            spacing: 8px;
-                            Text { text: r.name; width: 70px; font-size: 13px; vertical-alignment: center; }
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: UpdCols.gap;
                             Text {
-                                width: 62px;
+                                width: UpdCols.name;
+                                text: r.name;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                width: UpdCols.installed;
+                                text: r.from-ver;
                                 font-size: 12px;
                                 font-family: "Consolas";
-                                vertical-alignment: center;
-                                text: r.from-ver;
                                 color: #9aa0aa;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
+                            // A feed error replaces target, size and details with one
+                            // message that gets all of their width.
                             Rectangle {
-                                horizontal-stretch: 2;
-                                ComboBox {
-                                    visible: r.updatable;
-                                    x: 0px;
-                                    y: (parent.height - self.height) / 2;
-                                    width: Math.min(parent.width, 250px);
-                                    model: r.targets;
-                                    current-index: r.sel;
-                                    enabled: !root.busy;
-                                    selected(v) => { root.set-target(idx, self.current-index); }
-                                }
-                                Text {
-                                    visible: !r.updatable;
-                                    text: r.error != "" ? r.error : "up to date";
-                                    font-size: 12px;
-                                    color: r.error != "" ? #ff5c5c : #9aa0aa;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            Text { text: r.size; width: 56px; font-size: 11px; color: #9aa0aa; vertical-alignment: center; }
-                            Rectangle {
+                                min-width: 0px;
                                 horizontal-stretch: 1;
                                 Text {
-                                    text: r.note;
-                                    font-size: 10px;
-                                    color: #8a8f98;
+                                    visible: r.error != "";
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: r.error;
+                                    font-size: 11px;
+                                    color: #ff6b6b;
+                                    wrap: word-wrap;
                                     overflow: elide;
                                     vertical-alignment: center;
                                 }
+                                Rectangle {
+                                    visible: r.error == "";
+                                    HorizontalLayout {
+                                        spacing: UpdCols.gap;
+                                        Rectangle {
+                                            width: UpdCols.target;
+                                            ComboBox {
+                                                visible: r.updatable;
+                                                y: (parent.height - self.height) / 2;
+                                                width: parent.width;
+                                                model: r.targets;
+                                                current-index: r.sel;
+                                                enabled: !root.busy;
+                                                selected(v) => { root.set-target(idx, self.current-index); }
+                                            }
+                                            Text {
+                                                visible: !r.updatable;
+                                                width: parent.width;
+                                                height: parent.height;
+                                                text: "up to date";
+                                                font-size: 12px;
+                                                color: #7fbf86;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        Text {
+                                            width: UpdCols.size;
+                                            text: r.size;
+                                            font-size: 11px;
+                                            color: #9aa0aa;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            min-width: 0px;
+                                            horizontal-stretch: 1;
+                                            text: r.note;
+                                            font-size: 10px;
+                                            color: #8a8f98;
+                                            wrap: word-wrap;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
                             }
-                            Button {
-                                text: "Update";
-                                height: 24px;
-                                enabled: r.updatable && !root.busy;
-                                clicked => { root.do-apply(idx); }
+                            Rectangle {
+                                width: UpdCols.button;
+                                Button {
+                                    width: parent.width;
+                                    height: 26px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: "Update";
+                                    enabled: r.updatable && !root.busy;
+                                    clicked => { root.do-apply(idx); }
+                                }
                             }
-                            Button {
-                                text: "Restore";
-                                height: 24px;
-                                enabled: r.restorable && !root.busy;
-                                clicked => { root.do-restore(idx); }
+                            Rectangle {
+                                width: UpdCols.button;
+                                Button {
+                                    width: parent.width;
+                                    height: 26px;
+                                    y: (parent.height - self.height) / 2;
+                                    text: "Restore";
+                                    enabled: r.restorable && !root.busy;
+                                    clicked => { root.do-restore(idx); }
+                                }
                             }
                         }
                     }
@@ -501,6 +567,93 @@ export component DepWindow inherits Window {
     }
 }
 
+export struct InstallRow {
+    name: string,
+    choices: [string],
+    sel: int,
+    note: string,
+    error: string,
+}
+
+// First run: pick the version of each component before anything downloads.
+export component InstallWindow inherits Window {
+    title: "Install RAMP";
+    width: 620px;
+    height: 340px;
+    icon: @image-url("../assets/logo.png");
+
+    in property <[InstallRow]> rows;
+    in property <bool> busy;
+    in property <bool> ready;
+    in property <string> status;
+    in property <string> action-text: "Install";
+
+    callback set-choice(int, int);
+    callback action();
+    callback later();
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 10px;
+
+        Text { text: "Choose what to install"; font-size: 16px; font-weight: 600; }
+        Text {
+            text: "Supported releases only: MariaDB's long-term support lines, the PHP branches php.net still maintains, Apache Lounge's 2.4 builds. Every archive is checksum-verified before it is installed.";
+            color: #8a8f98;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+        Rectangle { height: 2px; }
+        for row[idx] in root.rows: HorizontalLayout {
+            spacing: 12px;
+            height: 34px;
+            Text { text: row.name; width: 90px; font-size: 13px; vertical-alignment: center; }
+            Rectangle {
+                width: 210px;
+                ComboBox {
+                    visible: row.choices.length > 0;
+                    x: 0px;
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width;
+                    model: row.choices;
+                    current-index: row.sel;
+                    // A single candidate (phpMyAdmin) is shown, not chosen.
+                    enabled: !root.busy && row.choices.length > 1;
+                    selected(v) => { root.set-choice(idx, self.current-index); }
+                }
+            }
+            Text {
+                text: row.error != "" ? row.error : row.note;
+                color: row.error != "" ? #ff5c5c : #9aa0aa;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+        Rectangle { vertical-stretch: 1; }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.status;
+                color: #8a8f98;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            // Always available: a slow or unreachable feed must not trap the user.
+            Button { text: "Later"; clicked => { root.later(); } }
+            Button {
+                text: root.action-text;
+                primary: true;
+                enabled: !root.busy;
+                clicked => { root.action(); }
+            }
+        }
+    }
+}
+
 export component AboutWindow inherits Window {
     title: "About RAMP Control Panel";
     width: 340px;
@@ -508,6 +661,7 @@ export component AboutWindow inherits Window {
     icon: @image-url("../assets/logo.png");
 
     in property <string> app-version;
+    in property <string> build-type;
 
     callback close_it();
 
@@ -518,6 +672,7 @@ export component AboutWindow inherits Window {
         Text { text: "RAMP Control Panel"; font-size: 16px; font-weight: 600; horizontal-alignment: center; }
         Rectangle { height: 10px; }
         Text { text: root.app-version; horizontal-alignment: center; }
+        Text { text: root.build-type; color: #8a8f98; font-size: 11px; horizontal-alignment: center; }
         Text { text: "by Loonaire"; horizontal-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
         HorizontalLayout {

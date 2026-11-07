@@ -36,6 +36,9 @@ pub struct Opts {
     pub target_line: String,
     /// Start both servers and fetch /phpmyadmin once everything is in place.
     pub verify: bool,
+    /// Builds chosen in the install window (or on the command line); a
+    /// component without one gets the newest build its feed offers.
+    pub picks: Vec<Info>,
 }
 
 /// Server binary the install actually ended up with, so ramp.ini can follow it
@@ -274,10 +277,126 @@ fn write_my_ini(basedir: &Path, port: u16, log: &mut dyn FnMut(String, bool)) ->
 }
 
 fn write_php_ini(basedir: &Path, log: &mut dyn FnMut(String, bool)) -> Result<(), String> {
-    let map = [("@ROOT@", fwd(basedir))];
+    let map = [
+        ("@ROOT@", fwd(basedir)),
+        ("@EXTENSIONS@", extension_lines(basedir, log)),
+    ];
     write_text(&basedir.join("php\\php.ini"), &fill(T_PHPINI, &map))?;
     log("php.ini written (RAMP defaults: 512M memory, 40M uploads, session files in tmp/)".into(), false);
     Ok(())
+}
+
+/// PHP's own test modules: shipped in every build, never meant to be loaded.
+const EXT_NEVER: [&str; 2] = ["dl_test", "zend_test"];
+
+/// Enabled when PHP cannot be asked (php.exe missing or not runnable).
+const EXT_FALLBACK: [&str; 12] = [
+    "mbstring", "bz2", "curl", "exif", "fileinfo", "gettext", "intl", "mysqli", "openssl",
+    "pdo_mysql", "pdo_sqlite", "zip",
+];
+
+/// The order php.ini wants: mbstring before exif (exif uses it), ldap before
+/// curl (php.ini-development's advice for OpenSSL builds), the rest sorted.
+fn ext_order(mut names: Vec<String>) -> Vec<String> {
+    names.sort();
+    names.dedup();
+    for first in ["ldap", "mbstring"] {
+        if let Some(i) = names.iter().position(|n| n == first) {
+            let n = names.remove(i);
+            names.insert(0, n);
+        }
+    }
+    names
+}
+
+/// The extension= and zend_extension= lines of a fresh php.ini: every extension
+/// of the installed build that loads cleanly. Each one is tried in a bare
+/// `php -n` (mbstring alongside, for exif), so one that needs a library PHP does
+/// not ship (Oracle, Firebird) or warns at startup stays off instead of filling
+/// every log with startup warnings.
+fn extension_lines(basedir: &Path, log: &mut dyn FnMut(String, bool)) -> String {
+    let php_dir = basedir.join("php");
+    let php = php_dir.join("php.exe");
+    let ext_dir = php_dir.join("ext");
+    let present: Vec<String> = fs::read_dir(&ext_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    n.strip_prefix("php_")?.strip_suffix(".dll").map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_opcache = present.iter().any(|n| n == "opcache");
+    let candidates = ext_order(
+        present
+            .into_iter()
+            .filter(|n| !EXT_NEVER.contains(&n.as_str()) && n != "opcache")
+            .collect(),
+    );
+    let ext_arg = format!("extension_dir={}", ext_dir.to_string_lossy());
+    let has_mb = candidates.iter().any(|n| n == "mbstring");
+    let loads = |directives: &[String]| -> Result<(), String> {
+        let mut args = vec!["-n".to_string(), "-d".to_string(), ext_arg.clone()];
+        for d in directives {
+            args.push("-d".into());
+            args.push(d.clone());
+        }
+        args.push("-r".into());
+        args.push("echo 'ok';".into());
+        match run_capture(&php, &args, Some(&php_dir), None) {
+            Ok((0, out)) if out.trim() == "ok" => Ok(()),
+            Ok((_, out)) => Err(tail(&out, 1)),
+            Err(e) => Err(e),
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    if !php.is_file() || loads(&[]).is_err() {
+        log("PHP could not be asked which extensions load: enabling the usual set".into(), true);
+        for n in EXT_FALLBACK.iter().filter(|n| candidates.iter().any(|c| c == *n)) {
+            lines.push(format!("extension={n}"));
+        }
+        return lines.join("\n");
+    }
+    let mut on: Vec<String> = Vec::new();
+    let mut off: Vec<String> = Vec::new();
+    for n in &candidates {
+        let mut set = Vec::new();
+        if has_mb && n != "mbstring" {
+            set.push("extension=mbstring".to_string());
+        }
+        set.push(format!("extension={n}"));
+        match loads(&set) {
+            Ok(()) => on.push(n.clone()),
+            Err(_) => off.push(n.clone()),
+        }
+    }
+    lines.extend(on.iter().map(|n| format!("extension={n}")));
+    // Built into PHP 8.5; a separate zend_extension before that.
+    if has_opcache && loads(&["zend_extension=opcache".to_string()]).is_ok() {
+        lines.push("zend_extension=opcache".into());
+        on.push("opcache".into());
+    }
+    // Loaded one by one they all worked; make sure the whole set agrees too.
+    if let Err(e) = loads(&lines) {
+        log(format!("PHP warns about the combined extension set: {e}"), true);
+    }
+    log(
+        format!("PHP extensions enabled ({}): {}", on.len(), on.join(", ")),
+        false,
+    );
+    if !off.is_empty() {
+        log(
+            format!(
+                "PHP extensions left off, they do not load without extra libraries: {}",
+                off.join(", ")
+            ),
+            false,
+        );
+    }
+    lines.join("\n")
 }
 
 /// Longest common prefix of two paths.
@@ -1009,7 +1128,10 @@ pub fn bootstrap(
         if !miss.contains(&comp) {
             continue;
         }
-        let info = pick(comp, &o.target_line)?;
+        let info = match o.picks.iter().find(|i| i.comp == comp) {
+            Some(chosen) => chosen.clone(),
+            None => pick(comp, &o.target_line)?,
+        };
         log(
             format!(
                 "{}: picking {} ({}, {})",
@@ -1200,6 +1322,25 @@ TransferLog "/access_log"
 CustomLog "/ssl_request_log" \
           "%t %h %{SSL_PROTOCOL}x %{SSL_CIPHER}x \"%r\" %b"
 "#;
+
+    #[test]
+    fn extensions_come_in_php_ini_order() {
+        let got = ext_order(
+            ["zip", "exif", "curl", "mbstring", "ldap", "bz2", "curl"].map(String::from).to_vec(),
+        );
+        assert_eq!(got, ["mbstring", "ldap", "bz2", "curl", "exif", "zip"]);
+    }
+
+    #[test]
+    fn php_ini_template_leaves_extensions_to_the_installer() {
+        assert_eq!(T_PHPINI.matches("@EXTENSIONS@").count(), 1);
+        let active: Vec<&str> = T_PHPINI
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("extension=") || l.starts_with("zend_extension="))
+            .collect();
+        assert!(active.is_empty(), "{active:?}");
+    }
 
     #[test]
     fn drive_root_file_only_takes_single_segment_paths() {
