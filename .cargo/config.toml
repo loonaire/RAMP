@@ -1,8 +1,8 @@
 [build]
 # Le dossier target/ d'origine contient des exécutables verrouillés par l'antivirus
-target-dir = "../xtarget"
+#target-dir = "../xtarget"
 
 [env]
 # `cargo run` installe les serveurs dans ../ramp-dev, jamais dans le dossier de
 # build que `cargo clean` efface. Un RAMP_BASEDIR déjà défini reste prioritaire.
-RAMP_BASEDIR = { value = "../ramp-dev", relative = true }
+#RAMP_BASEDIR = { value = "../ramp-dev", relative = true }
