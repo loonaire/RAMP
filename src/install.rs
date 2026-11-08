@@ -266,13 +266,16 @@ fn install_one(
 // ------------------------------------------------------------- configuration
 
 fn write_my_ini(basedir: &Path, port: u16, log: &mut dyn FnMut(String, bool)) -> Result<(), String> {
+    // MariaDB is already in place: the bind list depends on its version.
+    let bind = update::loopback_bind(update::installed_opt(basedir, Comp::Mysql).as_ref());
     let map = [
         ("@MYSQLDIR@", fwd(&basedir.join("mysql"))),
         ("@ROOT@", fwd(basedir)),
         ("@MPORT@", port.to_string()),
+        ("@BIND@", bind.to_string()),
     ];
     write_text(&basedir.join("mysql\\bin\\my.ini"), &fill(T_MYINI, &map))?;
-    log(format!("my.ini written for this location, port {port}"), false);
+    log(format!("my.ini written for this location, port {port}, listening on {bind}"), false);
     Ok(())
 }
 
@@ -1062,11 +1065,11 @@ fn verify_running(
 /// not open itself: killing a server the user started from another tree would
 /// be worse than skipping the check.
 fn port_free(port: u16) -> bool {
-    // 2 == MIB_TCP_STATE_LISTEN: TIME_WAIT sockets left by the seeding client
-    // are not a port conflict.
+    // Listeners only: TIME_WAIT sockets left by the seeding client are not a
+    // port conflict.
     !crate::netstat::tcp_table()
         .iter()
-        .any(|e| e.local == port && e.state == 2)
+        .any(|e| e.local == port && e.listening())
 }
 
 /// The process holding `port` when that process runs out of this very package:
@@ -1075,7 +1078,7 @@ fn port_free(port: u16) -> bool {
 fn own_listener(basedir: &Path, port: u16) -> Option<u32> {
     crate::netstat::tcp_table()
         .iter()
-        .filter(|e| e.local == port && e.state == 2)
+        .filter(|e| e.local == port && e.listening())
         .map(|e| e.pid)
         .find(|pid| crate::procs::pid_in_tree(basedir, *pid))
 }
@@ -1340,6 +1343,16 @@ CustomLog "/ssl_request_log" \
             .filter(|l| l.starts_with("extension=") || l.starts_with("zend_extension="))
             .collect();
         assert!(active.is_empty(), "{active:?}");
+    }
+
+    #[test]
+    fn my_ini_template_takes_the_bind_list_from_the_installer() {
+        let active: Vec<&str> = T_MYINI
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("bind-address") || l.starts_with("bind_address"))
+            .collect();
+        assert_eq!(active, vec!["bind-address = \"@BIND@\""]);
     }
 
     #[test]

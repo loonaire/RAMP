@@ -13,7 +13,7 @@ Un seul `ramp.exe` à poser dans un dossier vide. Au premier lancement, il tél�
 - **Versions au choix à l'installation** : branches LTS de MariaDB (sans celles en fin de vie), branches de PHP encore maintenues par php.net (support actif ou correctifs de sécurité seulement), builds Apache 2.4 d'Apache Lounge, dernier phpMyAdmin.
 - **PHP complet d'emblée** : chaque extension livrée avec PHP est testée à l'installation, et toutes celles qui se chargent seules sont activées (OPcache compris).
 - **Mises à jour sûres** : uniquement des archives, jamais d'installateurs. Le SHA256 est vérifié systématiquement, l'ancienne version est sauvegardée, la nouvelle doit démarrer, et sinon tout est remis en place. Un bouton *Restore* revient à la version précédente.
-- **Prudent par défaut** : MariaDB n'écoute que sur `127.0.0.1` et phpMyAdmin n'est accessible que depuis la machine. Les listes de versions et les sommes de contrôle ne transitent qu'en HTTPS, donc une archive servie par un miroir n'est acceptée que si son SHA256 correspond. L'alias `php-cgi` est retiré (CVE-2024-4577).
+- **Prudent par défaut** : MariaDB n'écoute que sur la boucle locale (`127.0.0.1` et `::1`, donc `localhost` répond tout de suite) et phpMyAdmin n'est accessible que depuis la machine. Les listes de versions et les sommes de contrôle ne transitent qu'en HTTPS, donc une archive servie par un miroir n'est acceptée que si son SHA256 correspond. L'alias `php-cgi` est retiré (CVE-2024-4577).
 - **Léger** : rendu logiciel, sans OpenGL, donc utilisable en machine virtuelle ou en bureau à distance.
 
 ## Installation

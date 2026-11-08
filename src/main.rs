@@ -2699,7 +2699,7 @@ fn stop_module(app: &mut App, ui: &Ui, idx: usize, wait: bool) {
         let port = app
             .tcp
             .iter()
-            .find(|e| e.state == 2 && pids.contains(&e.pid))
+            .find(|e| e.listening() && pids.contains(&e.pid))
             .map(|e| e.local)
             .unwrap_or(app.cfg.mysql_port);
         let basedir = app.basedir.clone();
@@ -3162,7 +3162,7 @@ fn apply_ports(app: &mut App, ui: &Ui, http: u16, https: u16, mysql: u16) {
         }
         let taken = netstat::tcp_table()
             .into_iter()
-            .find(|e| e.local == new && e.state == 2 && !procs::pid_in_tree(&bd, e.pid));
+            .find(|e| e.local == new && e.listening() && !procs::pid_in_tree(&bd, e.pid));
         if let Some(e) = taken {
             let who = app
                 .names

@@ -1433,6 +1433,8 @@ const PHP_CONF_INCLUDE: &str = "conf/extra/httpd-ramp.conf";
 ///    only covers request scope, not module init.
 ///  - php.ini: session.sid_length / session.sid_bits_per_character are deprecated
 ///    since PHP 8.5 and pollute the error log at every start; commented out.
+///  - my.ini: bind-address 127.0.0.1 alone made every "localhost" connection
+///    wait 2 s; widened to both loopbacks (mysql_bind_loopbacks).
 ///
 /// Idempotent: only rewrites files when something actually changes.
 pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
@@ -1445,6 +1447,7 @@ pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
     ensure_ini_fallback(basedir, log);
     disable_php_cgi_alias(basedir, log);
     crate::install::fix_ssl_conf(basedir, log);
+    mysql_bind_loopbacks(basedir, log);
     let php_exe = basedir.join("php").join("php.exe");
     let php_new = pe_version(&php_exe)
         .map(|v| ver_cmp(&v, &Ver([8, 5, 0, 0])) != std::cmp::Ordering::Less)
@@ -1459,6 +1462,80 @@ pub fn patch_compat(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
 
 fn read_text(p: &Path) -> Option<String> {
     fs::read_to_string(p).ok()
+}
+
+/// my.ini bind-address that keeps MariaDB local-only. Both loopbacks when the
+/// server takes a list (MariaDB 10.11+) and the machine has an IPv6 loopback:
+/// on Windows "localhost" resolves to ::1 first, and against 127.0.0.1 alone
+/// every such connection waits ~2 s for the IPv6 attempt to be refused.
+pub fn loopback_bind(mariadb: Option<&Ver>) -> &'static str {
+    bind_for(mariadb, std::net::TcpListener::bind("[::1]:0").is_ok())
+}
+
+fn bind_for(mariadb: Option<&Ver>, ipv6_loopback: bool) -> &'static str {
+    let takes_list = mariadb.is_some_and(|v| ver_cmp(v, &Ver([10, 11, 0, 0])).is_ge());
+    if takes_list && ipv6_loopback {
+        "127.0.0.1,::1"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+/// Trees set up before loopback_bind() bind 127.0.0.1 alone (RAMP's former
+/// default), which makes every "localhost" connection wait 2 s. That exact
+/// value is widened to both loopbacks; any other value is the user's own
+/// choice and stays. Applies at the next MariaDB start.
+fn mysql_bind_loopbacks(basedir: &Path, log: &mut dyn FnMut(String, bool)) {
+    let f = basedir.join("mysql").join("bin").join("my.ini");
+    let Some(text) = read_text(&f) else { return };
+    let want = loopback_bind(installed_opt(basedir, Comp::Mysql).as_ref());
+    let Some(out) = widen_loopback_bind(&text, want) else { return };
+    match fs::write(&f, out) {
+        Ok(()) => log(
+            format!(
+                "compat: my.ini, MariaDB now listens on {want}, so \"localhost\" no longer waits 2 s for IPv6 (applies at the next MySQL start)"
+            ),
+            false,
+        ),
+        Err(e) => log(format!("compat: cannot write {}: {e}", f.display()), true),
+    }
+}
+
+/// `text` with every server-section `bind-address = 127.0.0.1` set to `want`,
+/// or None when nothing changes. Line endings are kept.
+fn widen_loopback_bind(text: &str, want: &str) -> Option<String> {
+    if want == "127.0.0.1" {
+        return None;
+    }
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut server = false;
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let name = name.trim().to_ascii_lowercase();
+            server = matches!(name.as_str(), "mysqld" | "mariadbd" | "server" | "mariadb")
+                || name.starts_with("mysqld-")
+                || name.starts_with("mariadb-");
+        }
+        let old = server
+            && !t.starts_with('#')
+            && !t.starts_with(';')
+            && t.split_once('=').is_some_and(|(key, rest)| {
+                let key = key.trim().replace('_', "-").to_ascii_lowercase();
+                let value = rest.split('#').next().unwrap_or("").trim();
+                key == "bind-address" && value.trim_matches(|c| c == '"' || c == '\'') == "127.0.0.1"
+            });
+        if old {
+            out.push_str(&format!("bind-address = \"{want}\"   # loopback only, IPv4 and IPv6"));
+            changed = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push_str(nl);
+    }
+    changed.then_some(out)
 }
 
 /// Trees set up before PHP_CONF got its name load mod_php from another
@@ -2008,6 +2085,37 @@ mod tests {
             ("Security".into(), "security fixes only, until 2026-12-31".into())
         );
         assert_eq!(php_branch_label(&s["8.1"]).0, "EOL");
+    }
+
+    #[test]
+    fn both_loopbacks_only_where_mariadb_and_ipv6_allow() {
+        let new = Ver([12, 3, 3, 0]);
+        let old = Ver([10, 6, 28, 0]);
+        assert_eq!(bind_for(Some(&new), true), "127.0.0.1,::1");
+        assert_eq!(bind_for(Some(&new), false), "127.0.0.1");
+        assert_eq!(bind_for(Some(&old), true), "127.0.0.1");
+        assert_eq!(bind_for(None, true), "127.0.0.1");
+    }
+
+    #[test]
+    fn only_the_former_default_bind_is_widened() {
+        let both = "127.0.0.1,::1";
+        let ini = "[client]\r\nbind-address = 127.0.0.1\r\n[mysqld]\r\nport= 3306\r\n\
+                   bind-address = \"127.0.0.1\"   # a panel-managed install stays loopback-only\r\n\
+                   # bind-address = ::1          # for ipv6\r\n[mysqldump]\r\nquick\r\n";
+        let out = widen_loopback_bind(ini, both).expect("default line widened");
+        assert!(out.contains("[mysqld]\r\nport= 3306\r\nbind-address = \"127.0.0.1,::1\""));
+        // [client] is not the server; comments stay; CRLF is kept.
+        assert!(out.contains("[client]\r\nbind-address = 127.0.0.1\r\n"));
+        assert!(out.contains("# bind-address = ::1          # for ipv6\r\n"));
+        assert!(!out.contains("\n\n") && out.matches('\n').count() == out.matches("\r\n").count());
+        // Idempotent, and a value the user chose is left alone.
+        assert_eq!(widen_loopback_bind(&out, both), None);
+        assert_eq!(widen_loopback_bind("[mysqld]\nbind_address=0.0.0.0\n", both), None);
+        assert_eq!(widen_loopback_bind("[mysqld]\nbind_address=127.0.0.1\n", both).as_deref(),
+            Some("[mysqld]\nbind-address = \"127.0.0.1,::1\"   # loopback only, IPv4 and IPv6\n"));
+        // Nothing to widen to when only IPv4 is possible.
+        assert_eq!(widen_loopback_bind(ini, "127.0.0.1"), None);
     }
 
     #[test]

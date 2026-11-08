@@ -32,7 +32,7 @@ This project has been motivated by multiple things:
 - **Pick your versions at install time**: MariaDB LTS lines (end-of-life ones left out), the PHP branches php.net still maintains (active support or security fixes only), Apache Lounge 2.4 builds, the latest phpMyAdmin.
 - **Full PHP out of the box**: every extension shipped with PHP is tried at install time, and all those that load on their own are enabled (OPcache included).
 - **Safe updates**: archives only, never installers. The SHA256 is always checked, the old version is backed up, the new one must start, and everything is put back otherwise. A *Restore* button returns to the previous version.
-- **Careful defaults**: MariaDB listens on `127.0.0.1` only and phpMyAdmin is reachable from the local machine only. Version feeds and checksums travel over HTTPS only, so an archive served by a mirror is accepted only if its SHA256 matches. The `php-cgi` alias is removed (CVE-2024-4577).
+- **Careful defaults**: MariaDB listens on the loopback only (`127.0.0.1` and `::1`, so `localhost` answers at once) and phpMyAdmin is reachable from the local machine only. Version feeds and checksums travel over HTTPS only, so an archive served by a mirror is accepted only if its SHA256 matches. The `php-cgi` alias is removed (CVE-2024-4577).
 - **Lightweight**: software rendering, no OpenGL, so it works in virtual machines and over Remote Desktop.
 
 ## Installation
