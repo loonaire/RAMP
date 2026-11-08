@@ -1,6 +1,6 @@
 [package]
 name = "ramp"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "RAMP Control Panel: Apache, MariaDB, PHP and phpMyAdmin on Windows, in Rust + Slint (no Windows services)"
 
