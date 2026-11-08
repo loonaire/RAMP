@@ -1,0 +1,88 @@
+# Windows package for every pushed v* tag. release.ps1 builds ramp.exe with the
+# same toolchain as development (MSYS2 UCRT64 Rust, target x86_64-pc-windows-gnu)
+# and zips it with its SHA256; both files are kept as a workflow artifact and
+# attached to the tag's GitHub release, whose notes are the annotated tag's message.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # create the release and attach the package
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64 package
+    runs-on: windows-latest
+    env:
+      # Overrides target-dir = "../xtarget" from .cargo/config.toml (a local
+      # antivirus workaround): the build stays inside the checkout.
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+      CARGO_TERM_COLOR: always
+      # Passed through the environment, never pasted into a script.
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # rustc and cargo, plus GNU windres: build.rs embeds the exe icon with it
+      # (without windres the build still succeeds, but ramp.exe has no icon).
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-binutils
+
+      - name: Put the UCRT64 toolchain on PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          rustc -vV
+          cargo -V
+          windres --version | Select-Object -First 1
+
+      # Checks that the tag names the version in Cargo.toml, builds with
+      # --locked, writes dist\RAMP-<version>-win64.zip and its .sha256.
+      - name: Build and package
+        id: pkg
+        shell: pwsh
+        run: ./release.ps1 -Tag $env:TAG
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RAMP-${{ steps.pkg.outputs.version }}-win64
+          path: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.sha256 }}
+          if-no-files-found: error
+
+      - name: Attach to the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ZIP: ${{ steps.pkg.outputs.zip }}
+          SHA: ${{ steps.pkg.outputs.sha256 }}
+        run: |
+          # checkout can leave the tag lightweight: fetch the annotated tag
+          # itself, its message becomes the release notes.
+          git fetch --force --depth=1 origin "refs/tags/${env:TAG}:refs/tags/${env:TAG}"
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+              # Re-run of the same tag: replace the files, keep the release.
+              gh release upload $env:TAG $env:ZIP $env:SHA --clobber
+          } else {
+              $pre = @(if ($env:TAG -match '-') { '--prerelease' })
+              gh release create $env:TAG $env:ZIP $env:SHA --title "RAMP $env:TAG" --notes-from-tag --verify-tag @pre
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

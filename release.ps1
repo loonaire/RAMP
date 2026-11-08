@@ -15,6 +15,10 @@
     missing). Start it there: the first launch installs the servers next to it.
     An existing installation is kept as it is, only ramp.exe is replaced.
 
+    The GitHub workflow .github/workflows/release.yml runs this script on every
+    pushed v* tag, with -Tag: it then also hands the package paths to the next
+    workflow steps (GITHUB_OUTPUT).
+
 .PARAMETER InstallDir
     Folder to install or update ramp.exe in. Never inside cargo's target folder
     or inside this repository.
@@ -22,16 +26,24 @@
 .PARAMETER NoBuild
     Package the ramp.exe already built instead of running cargo build first.
 
+.PARAMETER Tag
+    Release tag being built (v0.5, v0.5.1...). The script stops when it does not
+    name the version in Cargo.toml, so a package never carries a wrong number.
+
 .EXAMPLE
     .\release.ps1
 
 .EXAMPLE
     .\release.ps1 -InstallDir C:\RAMP
+
+.EXAMPLE
+    .\release.ps1 -Tag v0.5
 #>
 [CmdletBinding()]
 param(
     [string]$InstallDir,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [string]$Tag
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,8 +54,18 @@ if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
 $version = ($meta.packages | Where-Object name -eq 'ramp').version
 $target = [IO.Path]::GetFullPath($meta.target_directory)
 
+if ($Tag) {
+    # Tags are short (v0.5 for 0.5.0); a pre-release tag must match exactly.
+    $want = $Tag -replace '^v', ''
+    if ($want -match '^\d+\.\d+$') { $want = "$want.0" }
+    if ($version -ne $want) {
+        throw "tag $Tag does not match version $version in Cargo.toml: bump the version or fix the tag"
+    }
+}
+
 if (-not $NoBuild) {
-    cargo build --release
+    # --locked: the package is built from Cargo.lock as committed, never re-resolved.
+    cargo build --release --locked
     if ($LASTEXITCODE -ne 0) { throw 'cargo build --release failed' }
 }
 $exe = Join-Path $target 'release\ramp.exe'
@@ -67,6 +89,13 @@ $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText("$zip.sha256", "$hash  $(Split-Path $zip -Leaf)`n")
 Write-Host "Package : $zip"
 Write-Host "SHA256  : $hash"
+if ($env:GITHUB_OUTPUT) {
+    Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8 -Value @(
+        "version=$version"
+        "zip=$zip"
+        "sha256=$zip.sha256"
+    )
+}
 
 # ---------------------------------------------------------------- install
 if (-not $InstallDir) { return }
